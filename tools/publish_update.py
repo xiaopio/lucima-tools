@@ -5,6 +5,7 @@ import argparse
 import base64
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -30,6 +31,7 @@ DEFAULT_PRIVATE_KEY = Path.home() / ".lucimatools" / "update-signing" / "private
 DEFAULT_PUBLIC_KEY = ROOT / "backend" / "update_public_key.json"
 DEFAULT_MANIFEST = ROOT / "deploy" / "update-server" / "stable.json"
 DEFAULT_OUTPUT = ROOT / "build" / "update-release"
+DEFAULT_BASE_URL = os.environ.get("LUCIMA_UPDATE_BASE_URL", "").strip()
 VERSION_RE = re.compile(r'APP_VERSION\s*=\s*["\']([^"\']+)["\']')
 SAFE_VERSION_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z.+-]*$")
 SAFE_REMOTE_RE = re.compile(r"^/[0-9A-Za-z._/-]+$")
@@ -145,10 +147,10 @@ def main() -> int:
     parser.add_argument("--public-key", type=Path, default=DEFAULT_PUBLIC_KEY)
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
-    parser.add_argument("--base-url", default="http://<update-host>")
+    parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
     parser.add_argument("--publish", action="store_true")
-    parser.add_argument("--server", default="root@<update-host>")
-    parser.add_argument("--remote-root", default="<remote-update-root>")
+    parser.add_argument("--server", default=os.environ.get("LUCIMA_UPDATE_SERVER", ""))
+    parser.add_argument("--remote-root", default=os.environ.get("LUCIMA_UPDATE_REMOTE_ROOT", ""))
     args = parser.parse_args()
 
     version = args.version.strip()
@@ -161,6 +163,10 @@ def main() -> int:
         raise SystemExit(f"Update signing key not found: {args.private_key.expanduser()}")
     if not args.public_key.is_file():
         raise SystemExit(f"Update public key not found: {args.public_key}")
+    if not args.base_url.strip():
+        raise SystemExit("Update base URL is required; pass --base-url or LUCIMA_UPDATE_BASE_URL")
+    if args.publish and (not args.server.strip() or not args.remote_root.strip()):
+        raise SystemExit("Publishing requires --server/--remote-root or their LUCIMA_UPDATE_* environment variables")
 
     release_dir = args.output_dir.resolve() / version
     release_dir.mkdir(parents=True, exist_ok=True)

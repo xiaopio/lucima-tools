@@ -14,16 +14,29 @@
 - pywebview 用系统 WebView2（Win10/11 自带 Edge 运行时）。
 """
 import glob
+import json
 import os
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 ROOT = os.path.abspath(os.getcwd())
+
+# 更新服务地址只允许在本地构建环境注入，不进入源码仓库。
+update_url = os.environ.get("LUCIMA_UPDATE_URL", "").strip()
+update_endpoint = os.path.join(ROOT, "build", "update-endpoint.json")
+if update_url:
+    os.makedirs(os.path.dirname(update_endpoint), exist_ok=True)
+    with open(update_endpoint, "w", encoding="utf-8") as stream:
+        json.dump({"manifestUrl": update_url}, stream, ensure_ascii=True)
+elif os.path.exists(update_endpoint):
+    os.remove(update_endpoint)
 
 # 数据文件：(源路径, 打包内相对目录)
 datas = [
     (os.path.join(ROOT, "frontend"), "frontend"),
     (os.path.join(ROOT, "assets"), "assets"),
 ]
+if update_url:
+    datas.append((update_endpoint, "."))
 # backend 下全部 json 数据表（新增数据文件无需再改本 spec）
 datas += [(p, "backend") for p in glob.glob(os.path.join(ROOT, "backend", "*.json"))]
 assert any(p.endswith("item_names.json") for p, _ in datas), "backend/item_names.json 缺失"

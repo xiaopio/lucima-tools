@@ -9,6 +9,21 @@ plugins {
 // 项目根（android/ 的上一级），backend / frontend / assets 都在这里
 val projectRoot = rootProject.projectDir.parentFile
 
+// 更新地址由本地构建环境注入，不能写进源码或仓库。
+val updateManifestUrl = System.getenv("LUCIMA_UPDATE_URL")?.trim().orEmpty()
+val updateEndpointFile = File(projectRoot, "build/update-endpoint.json")
+val writeUpdateEndpoint = tasks.register("writeUpdateEndpoint") {
+    doLast {
+        updateEndpointFile.parentFile.mkdirs()
+        if (updateManifestUrl.isBlank()) {
+            updateEndpointFile.delete()
+        } else {
+            val escaped = updateManifestUrl.replace("\\", "\\\\").replace("\"", "\\\"")
+            updateEndpointFile.writeText("{\"manifestUrl\":\"$escaped\"}", Charsets.UTF_8)
+        }
+    }
+}
+
 // ---------- 版本号：唯一真源是 backend/version.py，构建时正则读出 ----------
 // 以前 versionName 手工写在这里、关于页写在 index.html、后端又写在 server.py，
 // 三处各说各话（1.7 / 1.0.2 / 1.0）。现在只改 version.py 一处。
@@ -102,9 +117,11 @@ val copyBackend = tasks.register<Sync>("copyBackendPython") {
 }
 
 val copyWeb = tasks.register<Sync>("copyWebAssets") {
+    dependsOn(writeUpdateEndpoint)
     into(layout.projectDirectory.dir("src/main/assets/web"))
     from(File(projectRoot, "frontend")) { into("frontend") }
     from(File(projectRoot, "assets")) { into("assets") }
+    from(updateEndpointFile)
 }
 
 tasks.named("preBuild") {

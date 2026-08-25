@@ -1,6 +1,7 @@
 # LucimaTools Update Server
 
-Development endpoint: `http://<update-host>/stable.json`
+The update endpoint, publishing host, and remote directory are supplied only
+through local environment variables. Do not put those values in this repository.
 
 The manifest is an RS256-signed envelope. The signing private key stays only on
 the release workstation at:
@@ -23,6 +24,9 @@ a client release unless a planned key rotation is implemented first.
 python tools/publish_update.py `
   --windows-dir dist/LucimaTools `
   --android-apk android/app/build/outputs/apk/release/app-release.apk `
+  --base-url "https://<update-host>" `
+  --server "<ssh-user>@<update-host>" `
+  --remote-root "<remote-update-root>" `
   --min-supported 1.1.6 `
   --note "本次更新说明" `
   --publish
@@ -57,6 +61,6 @@ installation.
     └── <version>/
 ```
 
-The current Nginx configuration is `nginx-ip.conf`. HTTP by IP is for the
-development stage only; production should use a domain and HTTPS while keeping
+The Nginx configuration template is `nginx-ip.conf`; replace its placeholders
+only in the private server deployment. Use HTTPS in production while keeping
 manifest signatures and artifact hashes enabled.

@@ -25,9 +25,31 @@ from .update_security import UpdateSignatureError, verify_manifest_envelope
 
 log = _setup_log()
 
-MANIFEST_URL = os.environ.get(
-    "LUCIMA_UPDATE_URL", "http://<update-host>/stable.json"
-).strip()
+def _load_manifest_url() -> str:
+    """Load the update endpoint from local build/runtime configuration only."""
+    configured = os.environ.get("LUCIMA_UPDATE_URL", "").strip()
+    if configured:
+        return configured
+    asset_root = os.environ.get("ARK_ASSET_ROOT", "").strip()
+    candidates = []
+    if asset_root:
+        candidates.append(Path(asset_root) / "update-endpoint.json")
+    candidates.extend((
+        Path(__file__).resolve().parent / "update-endpoint.json",
+        Path(__file__).resolve().parent.parent / "update-endpoint.json",
+    ))
+    for path in candidates:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            endpoint = str(data.get("manifestUrl") or "").strip()
+            if endpoint:
+                return endpoint
+        except (OSError, ValueError, AttributeError):
+            continue
+    return ""
+
+
+MANIFEST_URL = _load_manifest_url()
 # Check for published updates about once per hour while the app is running.
 CHECK_INTERVAL = 60 * 60
 CHECK_JITTER = 15 * 60
@@ -180,6 +202,8 @@ class UpdateService:
         with self._lock:
             self._checking = True
         try:
+            if not MANIFEST_URL:
+                raise UpdateError("更新服务未配置")
             headers = {"Accept": "application/json"}
             if self._etag and self._payload is not None:
                 headers["If-None-Match"] = self._etag
