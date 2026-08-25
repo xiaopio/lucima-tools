@@ -53,12 +53,23 @@ web 资源，不会再出现"装了新包却跑旧前端"。
 签名私钥只保存在发布电脑的
 `%USERPROFILE%\.lucimatools\update-signing\private.pem`，不能上传服务器或提交仓库。
 
+更新服务地址不会写入源码。构建发布包前，在本机通过 `LUCIMA_UPDATE_URL`
+注入清单地址，构建脚本会将其写入包内的临时配置；该配置不进入 Git：
+
+```powershell
+$env:LUCIMA_UPDATE_URL = "https://<update-host>/stable.json"
+build.bat all
+```
+
 构建 Windows 目录和已签名 Android release APK 后执行：
 
 ```powershell
 python tools/publish_update.py `
   --windows-dir dist/LucimaTools `
   --android-apk android/app/build/outputs/apk/release/app-release.apk `
+  --base-url "https://<update-host>" `
+  --server "<ssh-user>@<update-host>" `
+  --remote-root "<remote-update-root>" `
   --min-supported 1.1.6 `
   --note "本次更新说明" `
   --publish
