@@ -26,6 +26,7 @@ from .tasks import (
     customized_equip_choose_main, customized_equip_reset, customized_equip_refresh,
     customized_equip_choose_sub, customized_equip_reward, UnknownEquipmentError,
     HUNT_ELEMENTS, HUNT_SWEEP_CANDIDATES, SWEEP_KINDS, hunt_sweep_scenes,
+    ELEMENT_SWEEP_ELEMENTS, element_sweep_scenes,
     list_teams, sweep_once, next_claim_times,
     activity_scenes, query_support_friends, activity_once,
     support_brief, trim_support_entry,
@@ -757,6 +758,12 @@ def sweep_options(account: str, kind: str = "hunt") -> dict:
     if kind == "hunt":
         scenes = hunt_sweep_scenes(acc.client.account_state or {})
         elements = [{"id": row["id"], "name": row["name"]} for row in HUNT_ELEMENTS]
+    elif kind == "elf":
+        scenes = element_sweep_scenes(acc.client.account_state or {})
+        elements = [
+            {"id": row["id"], "name": row["name"]}
+            for row in ELEMENT_SWEEP_ELEMENTS
+        ]
     else:
         scenes = SWEEP_KINDS.get(kind, HUNT_SWEEP_CANDIDATES)
         elements = []

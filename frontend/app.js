@@ -732,7 +732,10 @@ const TASK_ICON_UI = {
 // 生成任务图标 HTML：指定的界面图标优先，其次物品图标，最后回退 emoji/◆。
 function taskIconHTML(id, fallback = "◆") {
   const uiIcon = TASK_ICON_UI[id];
-  if (uiIcon) return `<img class="ticon-img" src="/assets/ui/${uiIcon}" alt="" loading="lazy">`;
+  const lightThemeClass = ["claim_mail", "hunt_sweep", "element_sweep", "activity_scene", "store_buy"].includes(id)
+    ? " task-icon-light-invert"
+    : "";
+  if (uiIcon) return `<img class="ticon-img${lightThemeClass}" src="/assets/ui/${uiIcon}" alt="" loading="lazy">`;
   const sid = TASK_ICON_IMG[id];
   if (sid) return `<img class="ticon-img" src="/static/assets/items/${sid}.png" alt="" loading="lazy">`;
   return TASK_ICONS[id] || fallback;
@@ -1320,11 +1323,8 @@ function renderShopWidget(t) {
           <button type="button" class="btn primary shop-start">▶ 开始刷新</button>
         </div>
         <div class="shop-right">
-          <div class="card-area" id="cardArea-${t.id}">
-            <div class="card-empty">
-              <img class="ce-icon-img" src="/assets/ui/equipment.png" alt="">
-              <div class="ce-text">命中筛选方案的<b>传说装备</b><br>会自动购买并显示在这里</div>
-            </div>
+          <div class="card-area star-source-card-area" id="cardArea-${t.id}">
+            ${secretShopStateHTML()}
           </div>
         </div>
       </div>
@@ -1363,6 +1363,11 @@ function bindShopWidget(id) {
   });
   bindDropdown(root.querySelector(".shop-equip-scheme"), (schemeId) => setShopCfg({ schemeId }));
   root.querySelector(".shop-start").addEventListener("click", () => runShopDiamond(id));
+  const saved = activeAcc()?.secretShopResult;
+  if (saved?.id === id) renderSecretShopState(id, saved);
+  if (shopRunning[activeAccount]) {
+    setSecretShopStartState(id, activeAccount, activeAcc()?.secretShopPending ? "matched" : "running");
+  }
 }
 
 // 一轮刷新的产出统计：把后端 bought({StaticID:数量}) 按购买目标分组累加。
@@ -1394,19 +1399,148 @@ const SHOP_TAG = "[秘密商店刷新(钻石)]";   // 该功能所有日志的�
 // ⚠️ 账号在循环期间锁定为发起时的账号：所有请求显式带 email、日志写该账号缓冲，
 // 即使用户中途切到别的账号，请求与日志也不会串（之前读全局 activeAccount 会串账号）。
 const shopRunning = {};  // email -> bool，改为按账号，切账号后仍可各自刷
-function renderSecretShopSchemeMatches(id, cards, round, email) {
-  if (email !== activeAccount || !cards?.length) return;
+
+function secretShopStateHTML(state) {
+  if (state?.cards?.length) {
+    const cardStates = state.cardStates || {};
+    const buying = Object.values(cardStates).includes("buying");
+    return `<div class="star-source-result-head"><span>第 ${state.round} 次刷新命中</span>
+      <div class="star-source-result-actions"><b>${state.cards.length} 件装备</b>
+        ${state.kind === "matched" ? `<button type="button" class="btn ghost secret-shop-skip"${buying ? " disabled" : ""}>跳过</button>` : ""}
+      </div></div>
+      <div class="star-source-card-grid">${state.cards.map((card, cardIndex) => {
+        const shelfIndex = Number.isInteger(card.index) ? card.index : cardIndex;
+        const cardState = cardStates[shelfIndex] || "";
+        const stateTag = cardState === "bought" ? '<span class="eq-flag buy">已购买</span>' : "";
+        const buttonText = cardState === "buying" ? "购买中…" : cardState === "bought" ? "已购买" : "购买";
+        const error = (state.cardErrors || {})[shelfIndex];
+        return `<div class="star-source-card-item">${equipCardHTML(card, stateTag)}
+          <div class="star-source-card-actions"><button type="button" class="btn primary secret-shop-buy" data-shelf-index="${shelfIndex}"${cardState === "buying" || cardState === "bought" ? " disabled" : ""}>${buttonText}</button></div>
+          ${error ? `<div class="star-source-card-error">${filterEscape(error)}</div>` : ""}
+        </div>`;
+      }).join("")}</div>`;
+  }
+  const icon = '<img class="star-source-empty-icon" src="/assets/ui/equipment.png" alt="">';
+  if (state?.kind === "running") {
+    return `<div class="card-empty">${icon}<div class="ce-text">正在刷新 ${state.round} / ${state.total}</div></div>`;
+  }
+  if (state?.kind === "error") {
+    return `<div class="card-empty">${icon}<div class="ce-text">${filterEscape(state.message || "刷新失败")}</div></div>`;
+  }
+  if (state?.kind === "empty") {
+    if (state.equipmentEnabled === false) {
+      return `<div class="card-empty">${icon}<div class="ce-text">已完成 ${state.total} 次刷新</div></div>`;
+    }
+    const summaries = [];
+    if (state.purchasedMatches) summaries.push(`已购买 ${state.purchasedMatches} 件命中装备`);
+    if (state.skippedMatches) summaries.push(`已跳过 ${state.skippedMatches} 轮命中装备`);
+    return `<div class="card-empty">${icon}<div class="ce-text">已完成 ${state.total} 次刷新<br>${summaries.length ? summaries.join("，") : "没有符合方案的装备"}</div></div>`;
+  }
+  return `<div class="card-empty">${icon}<div class="ce-text">命中筛选方案的<b>传说装备</b><br>会在这里等待购买或跳过</div></div>`;
+}
+
+function renderSecretShopState(id, state, email = activeAccount) {
+  const account = ACCOUNTS[email];
+  if (account) account.secretShopResult = { id, ...state };
+  if (email !== activeAccount) return;
   const area = $(`cardArea-${id}`);
   if (!area) return;
-  area.innerHTML = `<div class="secret-shop-match-head">第 ${round} 次刷新命中 ${cards.length} 件装备</div>
-    <div class="secret-shop-match-grid">${cards.map((card) => {
-      const tag = card.purchased
-        ? '<span class="eq-flag buy">已购买</span>'
-        : '<span class="eq-flag skip">购买失败</span>';
-      return `<div class="secret-shop-match-item">${equipCardHTML(card, tag)}
-        ${card.purchaseError ? `<div class="secret-shop-match-error">${filterEscape(card.purchaseError)}</div>` : ""}
-      </div>`;
-    }).join("")}</div>`;
+  area.classList.toggle("has-results", !!state?.cards?.length);
+  area.innerHTML = secretShopStateHTML(state);
+  bindSecretShopResultActions(id, email);
+}
+
+function setSecretShopStartState(id, email, mode) {
+  if (email !== activeAccount) return;
+  const button = $(`shop-${id}`)?.querySelector(".shop-start");
+  if (!button) return;
+  button.disabled = mode !== "idle";
+  button.textContent = mode === "matched" ? "等待选择…" : mode === "running" ? "刷新中…" : "▶ 开始刷新";
+}
+
+function resolveSecretShopPending(id, email, decision) {
+  const account = ACCOUNTS[email];
+  const pending = account?.secretShopPending;
+  if (!pending || pending.id !== id) return false;
+  account.secretShopPending = null;
+  setSecretShopStartState(id, email, "running");
+  pending.resolve(decision);
+  return true;
+}
+
+function bindSecretShopResultActions(id, email) {
+  const account = ACCOUNTS[email];
+  const state = account?.secretShopResult;
+  if (!account || state?.id !== id || email !== activeAccount) return;
+  const area = $(`cardArea-${id}`);
+  if (!area) return;
+
+  area.querySelector(".secret-shop-skip")?.addEventListener("click", () => {
+    const current = account.secretShopResult;
+    if (Object.values(current?.cardStates || {}).includes("buying")) return;
+    const boughtCount = current.cards.reduce((count, card, cardIndex) => {
+      const shelfIndex = Number.isInteger(card.index) ? card.index : cardIndex;
+      return count + (current.cardStates?.[shelfIndex] === "bought" ? 1 : 0);
+    }, 0);
+    resolveSecretShopPending(id, email, { action: "skip", count: boughtCount });
+  });
+
+  area.querySelectorAll(".secret-shop-buy").forEach((button) => button.addEventListener("click", async () => {
+    const shelfIndex = Number(button.dataset.shelfIndex);
+    let current = account.secretShopResult;
+    if (!Number.isInteger(shelfIndex) || current?.kind !== "matched") return;
+    const card = current.cards.find((item, cardIndex) =>
+      (Number.isInteger(item.index) ? item.index : cardIndex) === shelfIndex);
+    const cardStates = { ...(current.cardStates || {}), [shelfIndex]: "buying" };
+    const cardErrors = { ...(current.cardErrors || {}) };
+    delete cardErrors[shelfIndex];
+    renderSecretShopState(id, { ...current, cardStates, cardErrors }, email);
+    try {
+      const result = await api("/api/shop/buy", { account: email, index: shelfIndex });
+      if (result.status) applyStatus(email, result.status, result.nextClaims);
+      current = account.secretShopResult;
+      const nextStates = { ...(current.cardStates || {}) };
+      const nextErrors = { ...(current.cardErrors || {}) };
+      if (result.ok) {
+        nextStates[shelfIndex] = "bought";
+        delete nextErrors[shelfIndex];
+        const equipmentName = [card?.setCN, card?.slotCN].filter(Boolean).join("·") || "目标装备";
+        logTo(email, `${SHOP_TAG} 已购买 ${equipmentName}`, "ok");
+      } else {
+        delete nextStates[shelfIndex];
+        nextErrors[shelfIndex] = result.detail || "购买失败";
+        logTo(email, `${SHOP_TAG} ${nextErrors[shelfIndex]}`, "err");
+      }
+      renderSecretShopState(id, { ...current, cardStates: nextStates, cardErrors: nextErrors }, email);
+      const allBought = result.ok && current.cards.every((item, cardIndex) => {
+        const itemIndex = Number.isInteger(item.index) ? item.index : cardIndex;
+        return nextStates[itemIndex] === "bought";
+      });
+      if (allBought) {
+        resolveSecretShopPending(id, email, { action: "bought", count: current.cards.length });
+      }
+    } catch (error) {
+      current = account.secretShopResult;
+      const nextStates = { ...(current.cardStates || {}) };
+      const nextErrors = { ...(current.cardErrors || {}), [shelfIndex]: error.message };
+      delete nextStates[shelfIndex];
+      renderSecretShopState(id, { ...current, cardStates: nextStates, cardErrors: nextErrors }, email);
+      logTo(email, `${SHOP_TAG} 购买出错：${error.message}`, "err");
+    }
+  }));
+}
+
+function waitForSecretShopDecision(id, state, email) {
+  return new Promise((resolve) => {
+    const account = ACCOUNTS[email];
+    if (!account) {
+      resolve({ action: "skip", count: 0 });
+      return;
+    }
+    account.secretShopPending = { id, resolve };
+    renderSecretShopState(id, { ...state, kind: "matched", cardStates: {}, cardErrors: {} }, email);
+    setSecretShopStartState(id, email, "matched");
+  });
 }
 
 async function runShopDiamond(id) {
@@ -1422,57 +1556,99 @@ async function runShopDiamond(id) {
     return;
   }
   const schemeSnapshot = scheme ? JSON.parse(JSON.stringify(scheme)) : null;
-  const startBtn = $(`shop-${id}`).querySelector(".shop-start");
   shopRunning[email] = true;
-  startBtn.disabled = true;
-  startBtn.textContent = "刷新中…";
+  setSecretShopStartState(id, email, "running");
   const wanted = shopWantedIds();
   const gained = {};   // 本次整轮的目标道具产出累计，结束后并进收尾那一条日志
+  let completed = 0;
+  let skippedMatches = 0;
+  let purchasedMatches = 0;
   let endText = "刷新完成";   // 收尾文案：正常跑完/出错两种，与统计合成一句
   let endLv = "ok";
+  let failed = false;
   logTo(email, `${SHOP_TAG} 开始刷新：${cfg.count} 次${scheme ? `，装备方案“${scheme.name}”` : ""}`);
   try {
     for (let i = 1; i <= cfg.count; i++) {
+      renderSecretShopState(id, { kind: "running", round: i, total: cfg.count }, email);
       const r = await api("/api/shop/reset", {
         account: email, useGold: true, autoBuy: wanted,
         equipmentScheme: schemeSnapshot,
       });
+      completed = i;
       if (r.status) applyStatus(email, r.status, r.nextClaims);  // 每次刷新/购买后即时更新主页资产
       addShopGain(gained, r.bought);   // 失败中止的那次也可能已买到东西，先累加再判 ok
-      if (!r.ok) { logTo(email, `${SHOP_TAG} 第 ${i} 次刷新失败：${r.error || "未知错误"}，停止`, "err"); break; }
+      if (!r.ok) {
+        const message = r.error || "未知错误";
+        renderSecretShopState(id, { kind: "error", message }, email);
+        logTo(email, `${SHOP_TAG} 第 ${i} 次刷新失败：${message}，停止`, "err");
+        endText = "刷新中止";
+        endLv = "err";
+        failed = true;
+        break;
+      }
       (r.boughtLines || []).forEach((ln) => logTo(email, `${SHOP_TAG} 第 ${i} 次：${ln}`, "ok"));
       const buyErrs = r.buyErrors || [];
       buyErrs.forEach((ln) => logTo(email, `${SHOP_TAG} 第 ${i} 次：${ln}`, "err"));
       const legendaryMatches = r.legendaryMatches || [];
-      if (legendaryMatches.length) renderSecretShopSchemeMatches(id, legendaryMatches, i, email);
-      // 匹配到目标却没买成(金币不足/售罄等)：停止。继续刷只会白烧钻石——金币不足是
-      // 持续约束，下次遇到目标照样买不起；网络错误路径(HTTP 500)本就会 throw 跳出循环。
-      if (buyErrs.length) { logTo(email, `${SHOP_TAG} 第 ${i} 次有目标未购成，停止刷新（避免白耗钻石）`, "warn"); break; }
-      if (!(r.boughtLines || []).length) {
+      if (legendaryMatches.length) {
+        logTo(email, `${SHOP_TAG} 第 ${i} 次命中 ${legendaryMatches.length} 件装备，等待选择`, "ok");
+        const decision = await waitForSecretShopDecision(id, {
+          cards: legendaryMatches,
+          round: i,
+          total: cfg.count,
+          schemeName: scheme?.name || "",
+        }, email);
+        purchasedMatches += Number(decision?.count) || 0;
+        if (decision?.action === "bought") {
+          if (i < cfg.count && !buyErrs.length) logTo(email, `${SHOP_TAG} 本轮命中装备已全部购买，继续刷新`, "ok");
+        } else {
+          skippedMatches += 1;
+          if (i < cfg.count && !buyErrs.length) logTo(email, `${SHOP_TAG} 已跳过本轮剩余命中装备，继续刷新`);
+        }
+      }
+      // 普通自动购买目标没买成时继续刷新只会白耗钻石，因此仍按原逻辑停止；若同轮
+      // 也命中装备，先让用户看完并处理卡片，再执行停止逻辑。
+      if (buyErrs.length) {
+        const message = "有自动购买目标未购成，已停止刷新";
+        renderSecretShopState(id, { kind: "error", message }, email);
+        logTo(email, `${SHOP_TAG} 第 ${i} 次有目标未购成，停止刷新（避免白耗钻石）`, "warn");
+        endText = "刷新中止";
+        endLv = "warn";
+        failed = true;
+        break;
+      }
+      if (!(r.boughtLines || []).length && !legendaryMatches.length) {
         logTo(email, `${SHOP_TAG} 第 ${i} 次：无目标道具`);
       }
+    }
+    if (!failed) {
+      renderSecretShopState(id, {
+        kind: "empty",
+        total: completed,
+        skippedMatches,
+        purchasedMatches,
+        equipmentEnabled: !!scheme,
+      }, email);
     }
   } catch (e) {
     endText = `刷新出错：${e.message}`;
     endLv = "err";
+    renderSecretShopState(id, { kind: "error", message: e.message }, email);
   } finally {
     // 收尾一条日志 = 完成/出错 + 本轮统计。放 finally 里，提前中止(缺钱停止/出错)
     // 也能看到已获取的东西；一件没买到时只留前半句。
     const summary = shopGainSummary(gained);
     logTo(email, `${SHOP_TAG} ${endText}${summary ? "，" + summary : ""}`, endLv);
     shopRunning[email] = false;
-    // 按钮可能已因切账号被重渲染，仅当仍是同一账号面板时复位
-    if (email === activeAccount && startBtn.isConnected) {
-      startBtn.disabled = false;
-      startBtn.textContent = "▶ 开始刷新";
-    }
+    if (ACCOUNTS[email]) ACCOUNTS[email].secretShopPending = null;
+    setSecretShopStartState(id, email, "idle");
     refreshAccountStatus(email);
   }
 }
 
 const CARD_EMPTY = `<div class="card-empty">
   <img class="ce-icon-img" src="/assets/ui/equipment.png" alt="">
-  <div class="ce-text">命中筛选方案的<b>传说装备</b><br>会自动购买并显示在这里</div>
+  <div class="ce-text">命中筛选方案的<b>传说装备</b><br>会在这里等待购买或跳过</div>
 </div>`;
 
 const EQUIP_STAT_ICONS = Object.freeze({
@@ -1735,9 +1911,12 @@ function starSourceStateHTML(state) {
       + filterEscape(state.message || "刷新失败") + '</div></div>';
   }
   if (state?.kind === "empty") {
+    const summaries = [];
+    if (state.purchasedMatches) summaries.push("已购买 " + state.purchasedMatches + " 件命中装备");
+    if (state.skippedMatches) summaries.push("已跳过 " + state.skippedMatches + " 轮命中装备");
     return '<div class="card-empty">' + icon + '<div class="ce-text">已完成 '
-      + state.total + ' 次刷新<br>' + (state.skippedMatches
-        ? '已跳过 ' + state.skippedMatches + ' 轮命中装备'
+      + state.total + ' 次刷新<br>' + (summaries.length
+        ? summaries.join("，")
         : '没有符合方案的装备') + '</div></div>';
   }
   return '<div class="card-empty">' + icon + '<div class="ce-text">等待刷新结果</div></div>';
@@ -1749,6 +1928,7 @@ function renderStarSourceState(id, state, email = activeAccount) {
   if (email !== activeAccount) return;
   const area = $("starSourceArea-" + id);
   if (!area) return;
+  area.classList.toggle("has-results", !!state?.cards?.length);
   area.innerHTML = starSourceStateHTML(state);
   bindStarSourceResultActions(id, email);
 }
@@ -1761,6 +1941,16 @@ function setStarSourceStartState(id, email, mode) {
   button.textContent = mode === "matched" ? "等待选择…" : mode === "running" ? "刷新中…" : "▶ 开始刷新";
 }
 
+function resolveStarSourcePending(id, email, decision) {
+  const account = ACCOUNTS[email];
+  const pending = account?.starSourcePending;
+  if (!pending || pending.id !== id) return false;
+  account.starSourcePending = null;
+  setStarSourceStartState(id, email, "running");
+  pending.resolve(decision);
+  return true;
+}
+
 function bindStarSourceResultActions(id, email) {
   const account = ACCOUNTS[email];
   const state = account?.starSourceResult;
@@ -1771,11 +1961,7 @@ function bindStarSourceResultActions(id, email) {
   area.querySelector(".star-source-skip")?.addEventListener("click", () => {
     const current = account.starSourceResult;
     if (Object.values(current?.cardStates || {}).includes("buying")) return;
-    const pending = account.starSourcePending;
-    if (!pending || pending.id !== id) return;
-    account.starSourcePending = null;
-    setStarSourceStartState(id, email, "running");
-    pending.resolve();
+    resolveStarSourcePending(id, email, { action: "skip" });
   });
 
   area.querySelectorAll(".star-source-buy").forEach((button) => button.addEventListener("click", async () => {
@@ -1805,6 +1991,16 @@ function bindStarSourceResultActions(id, email) {
         logTo(email, "[星源商店刷新] " + nextErrors[shopIndex], "err");
       }
       renderStarSourceState(id, { ...current, cardStates: nextStates, cardErrors: nextErrors }, email);
+      const allBought = result.ok && current.cards.every((item, index) => {
+        const itemIndex = Number.isInteger(item.shopIndex) ? item.shopIndex : index;
+        return nextStates[itemIndex] === "bought";
+      });
+      if (allBought) {
+        resolveStarSourcePending(id, email, {
+          action: "bought",
+          count: current.cards.length,
+        });
+      }
     } catch (error) {
       current = account.starSourceResult;
       const nextStates = { ...(current.cardStates || {}) };
@@ -1917,6 +2113,7 @@ async function runStarSourceShop(id) {
   logTo(email, "[星源商店刷新] 开始刷新：" + cfg.count + " 次，方案“" + scheme.name + "”");
   let completed = 0;
   let skippedMatches = 0;
+  let purchasedMatches = 0;
   let failed = false;
   try {
     renderStarSourceState(id, { kind: "querying" }, email);
@@ -1949,22 +2146,36 @@ async function runStarSourceShop(id) {
       const matches = result.matches || [];
       if (matches.length) {
         logTo(email, "[星源商店刷新] 第 " + round + " 次命中 " + matches.length + " 件装备，等待选择", "ok");
-        await waitForStarSourceSkip(id, {
+        const decision = await waitForStarSourceSkip(id, {
           cards: matches,
           round,
           total: cfg.count,
           schemeName: scheme.name,
         }, email);
-        skippedMatches += 1;
-        if (round < cfg.count) {
+        if (decision?.action === "bought") {
+          purchasedMatches += Number(decision.count) || matches.length;
+          if (round < cfg.count) {
+            logTo(email, "[星源商店刷新] 本轮命中装备已全部购买，继续刷新", "ok");
+          }
+        } else {
+          skippedMatches += 1;
+        }
+        if (decision?.action !== "bought" && round < cfg.count) {
           logTo(email, "[星源商店刷新] 已跳过本轮命中，继续刷新");
         }
       }
     }
     if (!failed) {
-      renderStarSourceState(id, { kind: "empty", total: completed, skippedMatches }, email);
+      renderStarSourceState(id, {
+        kind: "empty",
+        total: completed,
+        skippedMatches,
+        purchasedMatches,
+      }, email);
       logTo(email, "[星源商店刷新] 已完成 " + completed + " 次刷新"
-        + (skippedMatches ? "，共跳过 " + skippedMatches + " 轮命中装备" : "，未发现符合方案的装备"));
+        + (purchasedMatches ? "，共购买 " + purchasedMatches + " 件命中装备" : "")
+        + (skippedMatches ? "，共跳过 " + skippedMatches + " 轮命中装备" : "")
+        + (!purchasedMatches && !skippedMatches ? "，未发现符合方案的装备" : ""));
     }
   } catch (error) {
     renderStarSourceState(id, { kind: "error", message: error.message }, email);
@@ -2167,7 +2378,7 @@ function renderCustomizedEquipWidget(task) {
     <div class="shop-body hidden"><div class="shop-grid customized-equip-grid"><div class="shop-left customized-equip-left">
       <div class="customized-field customized-set-field">
         <div class="customized-set-anchor">${customizedEquipSetButtonHTML()}
-          <div class="customized-set-popover hidden">${EQUIP_FILTER_SETS.map((set) => `<button type="button" data-customized-set="${set.id}" title="${set.label}"><img src="/assets/sets/${set.icon}.png" alt="${set.label}"></button>`).join("")}</div>
+          <div class="customized-set-popover hidden">${CUSTOMIZED_EQUIP_SETS.map((set) => `<button type="button" data-customized-set="${set.id}" title="${set.label}"><img src="/assets/sets/${set.icon}.png" alt="${set.label}"></button>`).join("")}</div>
         </div>
         <button type="button" class="customized-reset" data-customized-reset="set" title="重置套装" aria-label="重置套装">↺</button>
       </div>
@@ -2181,17 +2392,12 @@ function renderCustomizedEquipWidget(task) {
 }
 
 function customizedEquipIsRewarded(state) {
-  return !devPass() && String(state?.stage || "").toLowerCase() === "rewarded";
-}
-
-function customizedEquipEffectiveStage(state) {
-  const stage = String(state?.stage || "");
-  return devPass() && stage.toLowerCase() === "rewarded" ? "RefreshSubProp" : stage;
+  return String(state?.stage || "").toLowerCase() === "rewarded";
 }
 
 function syncCustomizedEquipControls(root) {
   const state = root._customizedState || {};
-  const stage = customizedEquipEffectiveStage(state);
+  const stage = String(state?.stage || "");
   const busy = root.classList.contains("busy");
   const rewarded = customizedEquipIsRewarded(state);
   const actionSelector = ".customized-set-button, .customized-set-popover button, .customized-reset, "
@@ -2340,7 +2546,7 @@ async function runCustomizedEquip(id) {
   const scheme = EQUIP_FILTER_SCHEMES_DATA.find((item) => item.id === cfg.schemeId);
   let state = root._customizedState || {};
   const validation = customizedEquipRuleStatus(state, cfg.schemeId);
-  if (!scheme || customizedEquipEffectiveStage(state) !== "RefreshSubProp" || !validation.valid) {
+  if (!scheme || String(state?.stage || "") !== "RefreshSubProp" || !validation.valid) {
     updateCustomizedEquipWidget(id, state, validation.valid ? "请先完成套装、部位和主属性选择" : validation.message);
     return;
   }
@@ -2419,10 +2625,7 @@ function getSweepCfg(id) {
 function setSweepCfg(id, patch) {
   localStorage.setItem(sweepLsKey(id), JSON.stringify({ ...getSweepCfg(id), ...patch }));
 }
-// 关卡下拉标签按扫荡类型区分
-const SWEEP_SCENE_LABEL = { hunt: "讨伐关卡", elf: "元素关卡" };
-
-// 元素 -> 主题色（讨伐关卡下拉的色点）
+// 元素 -> 主题色（讨伐与元素探索属性下拉的色点）
 const ELEMENT_COLOR = {
   fire: "#ff6b4a", water: "#5cd0ff", wood: "#4ce68a", dark: "#b98cff", light: "#ffd84a",
 };
@@ -2491,20 +2694,14 @@ function bindDropdown(root, onPick) {
 
 function renderSweepWidget(t) {
   const cfg = getSweepCfg(t.id);
-  const sceneLabel = SWEEP_SCENE_LABEL[t.sweepKind] || "关卡";
-  const sceneFields = t.sweepKind === "hunt"
-    ? `<div class="shop-row col">
-        <span class="shop-lbl">选择属性</span>
-        <div class="dd-slot sweep-element-slot"><div class="dd-loading">加载中…</div></div>
-      </div>
-      <div class="shop-row col">
-        <span class="shop-lbl">选择关卡</span>
-        <div class="dd-slot sweep-scene-slot"><div class="dd-loading">加载中…</div></div>
-      </div>`
-    : `<div class="shop-row col">
-        <span class="shop-lbl">${sceneLabel}</span>
-        <div class="dd-slot sweep-scene-slot"><div class="dd-loading">加载中…</div></div>
-      </div>`;
+  const sceneFields = `<div class="shop-row col">
+      <span class="shop-lbl">选择属性</span>
+      <div class="dd-slot sweep-element-slot"><div class="dd-loading">加载中…</div></div>
+    </div>
+    <div class="shop-row col">
+      <span class="shop-lbl">选择关卡</span>
+      <div class="dd-slot sweep-scene-slot"><div class="dd-loading">加载中…</div></div>
+    </div>`;
   return `<div class="shop-widget sweep-host" id="sweep-${t.id}" data-kind="${t.sweepKind || "hunt"}">
     <div class="shop-head">
       <div class="ticon">${taskIconHTML(t.id, "⚔️")}</div>
@@ -2582,7 +2779,7 @@ async function loadSweepOptions(id) {
       : [{ val: "", label: "（无已保存的队伍）" }];
 
     const teamVal = cfg.teamId && teams.some((t) => t.id === cfg.teamId) ? cfg.teamId : teamOpts[0]?.val || "";
-    if (kind === "hunt" && elementSlot) {
+    if (elementSlot && elements.length) {
       const elementOpts = elements.map((e) => ({ val: e.id, label: e.name, element: e.id }));
       const savedScene = scenes.find((scene) => scene.id === cfg.sceneId);
       const elementVal = elements.some((e) => e.id === cfg.element)
@@ -4289,11 +4486,6 @@ function renderDevConsole() {
     devCheckJson();
     renderDevLoop();
     ensureDevHistoryPoll();
-    document.querySelectorAll('[id^="customizedequip-"]').forEach((root) => {
-      if (!root._customizedState) return;
-      const id = root.id.replace(/^customizedequip-/, "");
-      updateCustomizedEquipWidget(id, root._customizedState);
-    });
   }
 }
 
@@ -4345,6 +4537,10 @@ const EQUIP_FILTER_SETS = Object.freeze([
   { id: "Rage", label: "暴怒", icon: "Rage" },
   { id: "Torrent", label: "飞流", icon: "Riptide" },
 ]);
+// 装备活动的可选套装不包含飞流；装备过滤器仍保留完整套装列表。
+const CUSTOMIZED_EQUIP_SETS = Object.freeze(
+  EQUIP_FILTER_SETS.filter((set) => set.id !== "Torrent"),
+);
 const EQUIP_FILTER_STATS = Object.freeze([
   { id: "AttackValue", label: "攻击力", unit: "", icon: "Attack.png" },
   { id: "AttackRate", label: "攻击力%", unit: "%", icon: "Attack.png" },

@@ -994,7 +994,7 @@ def shop_reset(c: GameClient, use_gold: bool, auto_buy_sids: list,
     """刷新一次秘密商店：
     1) ResetRandomStore（use_gold 决定花钻/免费）
     2) 服务器端立即买掉普通档里 StaticID∈auto_buy_sids 的
-    3) 收集 85 级传说装备；提供筛选方案时，命中方案的装备立即购买
+    3) 收集 85 级传说装备；提供筛选方案时，只返回命中的装备供前端选择
     返回本次结果 + 缓存本次货架 records（供 shop_buy_index 用）。
     """
     wanted = [str(x) for x in (auto_buy_sids or [])]
@@ -1008,7 +1008,6 @@ def shop_reset(c: GameClient, use_gold: bool, auto_buy_sids: list,
     counter: dict = {}
     legendaries = []
     legendary_matches = []
-    legendary_lines = []
     buy_errors = []  # 目标道具购买失败(缺钱等)：不吞掉，暴露给前端而不是悄悄漏买
     for idx, rec in enumerate(records):
         if rec.get("BuyCount"):
@@ -1032,21 +1031,7 @@ def shop_reset(c: GameClient, use_gold: bool, auto_buy_sids: list,
                 card["index"] = idx
                 legendaries.append(card)
                 if isinstance(equipment_scheme, dict) and equipment_matches_filter_scheme(equip, equipment_scheme):
-                    matched = {**card, "purchased": False}
-                    payload = c._auth_data({
-                        "Record": _to_send_format(rec), "Count": 1, "ItemIndex": -1,
-                        "Platform": "WebGLPlayer", "LoginType": "Erolabs",
-                        "NewErolabs": 0, "SelectRoleID": "",
-                    })
-                    label = f"{card['level']}级{card['tierName']}·{card['setCN']}套装·{card['slotCN']}"
-                    try:
-                        c.call("StoreHandler.BuyCommodity", payload)
-                        matched["purchased"] = True
-                        legendary_lines.append(f"购买 {label}")
-                    except GameMessage as message:
-                        matched["purchaseError"] = message.msg
-                        buy_errors.append(f"第 {idx + 1} 档({label})购买失败：{message.msg}")
-                    legendary_matches.append(matched)
+                    legendary_matches.append(card)
             continue
         sid = _record_goods_sid(rec)
         if sid is not None and str(sid) in wanted:
@@ -1066,7 +1051,7 @@ def shop_reset(c: GameClient, use_gold: bool, auto_buy_sids: list,
     lines = [f"购买 {_fmt_items(counter)}"] if counter else []
     return {
         "ok": True, "records": records, "bought": counter,
-        "boughtLines": [*lines, *legendary_lines], "buyErrors": buy_errors,
+        "boughtLines": lines, "buyErrors": buy_errors,
         "legendaries": legendaries, "legendaryMatches": legendary_matches,
     }
 
@@ -1830,25 +1815,46 @@ def hunt_sweep_scenes(state: dict) -> list[dict]:
 # 保留名称供旧调用方导入；实际选项由 hunt_sweep_scenes 根据账号快照生成。
 HUNT_SWEEP_CANDIDATES: list[dict] = []
 
-# 元素扫荡（游戏内"元素探索"，loc: T_Episode_Name_Elf）。与讨伐同走 SceneHandler.FinishScene，
-# 场景对象结构完全一致，故复用 sweep_once。区别: 元素探索有"难度"维度——每个元素 4 档
-# (_1 初级 / _2 中级 / _3 上级 / _4 地狱级)，5 元素共 20 关，全部作为关卡下拉候选。
-# 元素→(中文, 前端色点 element key) 映射，与讨伐一致(ElfIce=水, ElfEarth=木)。
-_ELF_ELEMENTS = [
-    ("ElfFire", "火", "fire"),
-    ("ElfIce", "水", "water"),
-    ("ElfEarth", "木", "wood"),
-    ("ElfDark", "暗", "dark"),
-    ("ElfLight", "光", "light"),
+# 元素扫荡（游戏内“元素探索”，loc: T_Episode_Name_Elf）。账号快照只会为已解锁
+# 场景生成 Scenes 记录，因此与讨伐相同，直接从快照读取并按属性、难度拆分展示。
+# StaticID: ElfFire_1 初级 / _2 中级 / _3 上级 / _4 地狱级。
+ELEMENT_SWEEP_ELEMENTS = [
+    {"id": "fire", "name": "火", "system": "ElfFire"},
+    {"id": "wood", "name": "木", "system": "ElfEarth"},
+    {"id": "water", "name": "水", "system": "ElfIce"},
+    {"id": "dark", "name": "暗", "system": "ElfDark"},
+    {"id": "light", "name": "光", "system": "ElfLight"},
 ]
-# 只暴露地狱级(_4)——用户只跑最高难度拿最高级元素。要放开其它档在此加回即可。
-_ELF_TIERS = [("4", "地狱级")]
-ELEMENT_SWEEP_CANDIDATES = [
-    {"id": f"{sys_}_{tier}", "system": sys_, "element": color,
-     "name": f"{cn}元素·{tier_cn}"}
-    for sys_, cn, color in _ELF_ELEMENTS
-    for tier, tier_cn in _ELF_TIERS
-]
+_ELF_RE = re.compile(r"^(Elf(?:Fire|Earth|Ice|Dark|Light))_(\d+)$")
+_ELF_TIER_NAMES = {1: "初级", 2: "中级", 3: "上级", 4: "地狱级"}
+
+
+def element_sweep_scenes(state: dict) -> list[dict]:
+    """返回账号已解锁的全部元素探索关卡，属性内按难度倒序。"""
+    by_system: dict[str, list[tuple[int, str]]] = {
+        element["system"]: [] for element in ELEMENT_SWEEP_ELEMENTS
+    }
+    for scene in (state or {}).get("SceneDataContainer", {}).get("Scenes", []):
+        match = _ELF_RE.match(str(scene.get("StaticID", "")))
+        if not match or match.group(1) not in by_system:
+            continue
+        by_system[match.group(1)].append((int(match.group(2)), match.group(0)))
+
+    result = []
+    for element in ELEMENT_SWEEP_ELEMENTS:
+        stages = sorted(by_system[element["system"]], reverse=True)
+        result.extend({
+            "id": scene_id,
+            "system": element["system"],
+            "element": element["id"],
+            "floor": floor,
+            "name": _ELF_TIER_NAMES.get(floor, f"关卡{floor}"),
+        } for floor, scene_id in stages)
+    return result
+
+
+# 保留名称供旧调用方导入；实际选项由 element_sweep_scenes 根据账号快照生成。
+ELEMENT_SWEEP_CANDIDATES: list[dict] = []
 
 # 扫荡类任务的候选关卡集合，供 sweep_options 按 kind 选择。
 SWEEP_KINDS = {
@@ -2592,7 +2598,7 @@ TASKS: dict[str, dict] = {
         "kind": "manual", "ui": "sweep", "sweepKind": "hunt",  # 前端自定义渲染，走 /api/sweep/* 而非 /api/tasks/run
     },
     "element_sweep": {
-        "name": "元素探索", "desc": "选元素关卡(5元素·地狱级)+队伍，按次数循环扫荡，无掉落自动停止",
+        "name": "元素探索", "desc": "选择属性、已解锁关卡与队伍，按次数循环扫荡，无掉落自动停止",
         "kind": "manual", "ui": "sweep", "sweepKind": "elf",
     },
     "activity_scene": {

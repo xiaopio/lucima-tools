@@ -10,13 +10,16 @@ settings.local.json
 logs/
 *.log
 
-# ===================== 本地研究 / 试稿 =====================
-# 协议逆向、抓包与 UI 试稿不属于 LucimaTools 发布源码。
+# ===================== 本地研究 / 预览 =====================
+# 协议逆向与抓包资料不属于 LucimaTools 发布源码。
 /capture/
-/mockups/
 /recon/
 /capture_browser.bat
 /capture_proxy.bat
+
+# UI 预览、截图和临时样板统一放在 previews/；只跟踪目录说明。
+/previews/*
+!/previews/README.md
 
 # 本地测试与外部 Wiki 全量资源不进入发布仓库。
 /tests/

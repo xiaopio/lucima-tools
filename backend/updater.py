@@ -28,7 +28,8 @@ log = _setup_log()
 MANIFEST_URL = os.environ.get(
     "LUCIMA_UPDATE_URL", "http://<update-host>/stable.json"
 ).strip()
-CHECK_INTERVAL = 4 * 60 * 60
+# Check for published updates about once per hour while the app is running.
+CHECK_INTERVAL = 60 * 60
 CHECK_JITTER = 15 * 60
 RETRY_INTERVAL = 30 * 60
 MAX_ARTIFACT_SIZE = 1024 * 1024 * 1024
