@@ -27,15 +27,25 @@ exit /b 1
 
 :do_all
 call :win
+if errorlevel 1 goto failed
 call :android
+if errorlevel 1 goto failed
+call :package_all
+if errorlevel 1 goto failed
 goto summary
 
 :do_win
 call :win
+if errorlevel 1 goto failed
+call :package_win
+if errorlevel 1 goto failed
 goto summary
 
 :do_android
 call :android
+if errorlevel 1 goto failed
+call :package_android
+if errorlevel 1 goto failed
 goto summary
 
 REM =============== Windows exe (PyInstaller) ===============
@@ -45,7 +55,7 @@ echo === [Windows] Building desktop exe ===
 taskkill /F /IM LucimaTools.exe >nul 2>&1
 if exist "dist\LucimaTools" rmdir /s /q "dist\LucimaTools"
 python -m PyInstaller desktop\LucimaTools.spec --noconfirm --clean
-exit /b
+exit /b %errorlevel%
 
 REM =============== Android APK (Gradle + Chaquopy) ===============
 :android
@@ -55,8 +65,22 @@ if "%JAVA_HOME%"=="" if exist "%ProgramFiles%\Android\Android Studio\jbr" set "J
 if "%ANDROID_HOME%"=="" if exist "%LOCALAPPDATA%\Android\Sdk" set "ANDROID_HOME=%LOCALAPPDATA%\Android\Sdk"
 pushd "%~dp0android"
 call gradlew.bat :app:assembleDebug --console=plain
+set "GRADLE_RESULT=%errorlevel%"
 popd
-exit /b
+exit /b %GRADLE_RESULT%
+
+REM =============== Versioned debug packages ===============
+:package_all
+python tools\package_debug.py --clean --windows-dir dist\LucimaTools --android-apk android\app\build\outputs\apk\debug\app-debug.apk
+exit /b %errorlevel%
+
+:package_win
+python tools\package_debug.py --windows-dir dist\LucimaTools
+exit /b %errorlevel%
+
+:package_android
+python tools\package_debug.py --android-apk android\app\build\outputs\apk\debug\app-debug.apk
+exit /b %errorlevel%
 
 :summary
 echo.
@@ -64,5 +88,15 @@ echo ============================================
 echo   Build finished.
 if exist "dist\LucimaTools\LucimaTools.exe" echo   Windows : dist\LucimaTools\LucimaTools.exe  (folder: dist\LucimaTools)
 if exist "android\app\build\outputs\apk\debug\app-debug.apk" echo   Android : android\app\build\outputs\apk\debug\app-debug.apk
+python -c "from backend.version import APP_VERSION; print(f'  Debug   : debug\\{APP_VERSION}\\')"
 echo ============================================
 pause
+exit /b 0
+
+:failed
+echo.
+echo ============================================
+echo   Build failed. Debug packages were not completed.
+echo ============================================
+pause
+exit /b 1

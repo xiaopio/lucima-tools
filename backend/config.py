@@ -15,6 +15,8 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import threading
+import time
 from pathlib import Path
 
 from .version import APP_VERSION  # noqa: F401  （版本唯一真源，见 version.py）
@@ -22,33 +24,64 @@ from .version import APP_VERSION  # noqa: F401  （版本唯一真源，见 vers
 # ---------- 平台标志 ----------
 # 由入口（desktop/run.py 或 Android 桥）设置为 "windows" / "android"。
 PLATFORM = os.environ.get("ARK_PLATFORM", "windows")
+# start.bat is the local test server. In this mode a page refresh may restore
+# the single in-memory session without forcing another login click.
+TEST_SERVER = os.environ.get("ARK_TEST_SERVER", "").lower() in ("1", "true", "yes")
 
 # ---------- 可持久化设置 ----------
 _DATA_DIR = Path(os.environ.get("ARK_DATA_DIR", Path(__file__).resolve().parent.parent))
 _SETTINGS_FILE = _DATA_DIR / "settings.json"
+_SETTINGS_LOCK = threading.RLock()
 
 _DEFAULT_MANUAL = "http://127.0.0.1:7890"
 
 
 def _load_settings() -> dict:
-    try:
-        return json.loads(_SETTINGS_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    with _SETTINGS_LOCK:
+        try:
+            return json.loads(_SETTINGS_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
 
 
-def _save_settings(data: dict) -> None:
-    try:
-        _DATA_DIR.mkdir(parents=True, exist_ok=True)
-        _SETTINGS_FILE.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-    except Exception:
-        pass
+def _save_settings(data: dict) -> bool:
+    with _SETTINGS_LOCK:
+        temporary = _SETTINGS_FILE.with_suffix(_SETTINGS_FILE.suffix + ".tmp")
+        try:
+            _DATA_DIR.mkdir(parents=True, exist_ok=True)
+            temporary.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            os.replace(temporary, _SETTINGS_FILE)
+            return True
+        except Exception:
+            try:
+                temporary.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return False
 
 
-# 运行时内存态
-_settings = _load_settings()
+def _purge_legacy_passwords() -> dict:
+    """升级到 Token 登录时立即移除旧版可逆 Base64 密码。"""
+    with _SETTINGS_LOCK:
+        settings = _load_settings()
+        changed = False
+        for record in (settings.get("accounts") or {}).values():
+            if not isinstance(record, dict):
+                continue
+            for key in ("password_b64", "save_pwd", "password"):
+                if key in record:
+                    record.pop(key, None)
+                    changed = True
+        if changed:
+            if not _save_settings(settings):
+                raise RuntimeError("无法清除旧版保存密码，请检查数据目录写入权限")
+        return settings
+
+
+# 运行时内存态。迁移必须早于任何账号读取，避免旧密码继续留在磁盘。
+_settings = _purge_legacy_passwords()
 _env_proxy = os.environ.get("ARK_PROXY")
 # 模式：env 指定了代理→manual；否则用存档；再否则默认 system（跟随系统）
 PROXY_MODE: str = (
@@ -123,71 +156,131 @@ def set_proxy(proxy: str) -> str:
     return get_proxy()
 
 
-# ---------- 多账号持久化 ----------
-# settings.json 里 accounts 是个字典：email -> {password_b64, save_pwd, toggles, params, order}
-#   - password_b64: base64 混淆的密码（save_pwd=True 时才存；仅本机，非加密，防肩窥级别）
-#   - save_pwd: 用户是否勾选了"保存密码"
-#   - toggles: {task_id: bool} 该账号开启的自动任务开关
-#   - params:  {task_id: {...}} 自动任务参数（如购买目标白名单）
-#   - order:   排序用的整数（添加顺序）
-import base64 as _b64
+def data_dir() -> Path:
+    """Return the writable application data root used by this process."""
+    return _DATA_DIR
 
 
-def _enc_pwd(pw: str) -> str:
-    return _b64.b64encode(pw.encode("utf-8")).decode("ascii")
+def get_ignored_update_version() -> str:
+    return str(_load_settings().get("ignored_update_version") or "")
 
 
-def _dec_pwd(s: str) -> str:
-    try:
-        return _b64.b64decode(s.encode("ascii")).decode("utf-8")
-    except Exception:
-        return ""
+def set_ignored_update_version(version: str) -> None:
+    with _SETTINGS_LOCK:
+        settings = _load_settings()
+        settings["ignored_update_version"] = str(version or "")
+        if not _save_settings(settings):
+            raise RuntimeError("无法保存更新偏好，请检查数据目录写入权限")
+
+
+# ---------- 设备身份 / 多账号持久化 ----------
+# settings.json 的账号条目只保存任务配置和平台原生加密后的 auth_blob。密码永不落盘，
+# accessToken/userId/refreshToken 也不会以明文出现在 JSON 中。
+_AUTH_UNSET = object()
+
+
+def get_device_id() -> str:
+    """返回每个安装实例固定的 40 位随机设备 ID。"""
+    with _SETTINGS_LOCK:
+        settings = _load_settings()
+        value = str(settings.get("device_id") or "").lower()
+        if len(value) == 40 and all(ch in "0123456789abcdef" for ch in value):
+            return value
+        value = secrets.token_hex(20)
+        settings["device_id"] = value
+        if not _save_settings(settings):
+            raise RuntimeError("无法持久化设备 ID，请检查数据目录写入权限")
+        return value
+
+
+def _normalize_auth(auth: dict) -> dict:
+    normalized = {
+        "kind": str(auth.get("kind") or "erolabs-v2"),
+        "user_id": str(auth.get("user_id") or auth.get("userId") or ""),
+        "access_token": str(auth.get("access_token") or auth.get("accessToken") or ""),
+        "refresh_token": str(auth.get("refresh_token") or auth.get("refreshToken") or ""),
+        "device_id": str(auth.get("device_id") or auth.get("deviceId") or get_device_id()),
+        "saved_at": int(auth.get("saved_at") or time.time()),
+    }
+    if not normalized["user_id"] or not normalized["access_token"]:
+        raise ValueError("登录 Token 缺少 user_id/access_token")
+    return normalized
+
+
+def _protect_auth(email: str, auth: dict) -> str:
+    from .token_vault import protect
+
+    plaintext = json.dumps(_normalize_auth(auth), ensure_ascii=False, separators=(",", ":"))
+    return protect(PLATFORM, plaintext, email)
+
+
+def _unprotect_auth(email: str, ciphertext: str) -> dict:
+    from .token_vault import unprotect
+
+    value = json.loads(unprotect(PLATFORM, ciphertext, email))
+    if not isinstance(value, dict):
+        raise ValueError("登录 Token 内容格式无效")
+    return _normalize_auth(value)
 
 
 def load_accounts() -> dict:
-    """返回 email -> 账号存档 dict（含解密后的 password 字段，供后端登录用）。"""
+    """返回账号存档；解密后的 ``auth`` 仅供后端使用，不会下发前端。"""
     s = _load_settings()
     accs = s.get("accounts") or {}
     out = {}
     for email, rec in accs.items():
         rec = dict(rec or {})
-        rec["password"] = _dec_pwd(rec.get("password_b64", "")) if rec.get("save_pwd") else ""
+        rec.pop("password_b64", None)
+        rec.pop("save_pwd", None)
+        blob = str(rec.get("auth_blob") or "")
+        rec["auth"] = None
+        rec["auth_error"] = False
+        if blob:
+            try:
+                rec["auth"] = _unprotect_auth(email, blob)
+            except Exception:
+                rec["auth_error"] = True
         out[email] = rec
     return out
 
 
-def save_account(email: str, *, password: str | None = None, save_pwd: bool | None = None,
+def save_account(email: str, *, auth: dict | None | object = _AUTH_UNSET,
                  toggles: dict | None = None, params: dict | None = None) -> None:
     """新增/更新一个账号存档。只更新传入的字段，其余保留。"""
-    s = _load_settings()
-    accs = s.get("accounts") or {}
-    rec = dict(accs.get(email) or {})
-    if "order" not in rec:
-        rec["order"] = len(accs)
-    if save_pwd is not None:
-        rec["save_pwd"] = bool(save_pwd)
-    # 密码：save_pwd 为真且给了密码才存；save_pwd 为假则清除
-    if rec.get("save_pwd"):
-        if password:
-            rec["password_b64"] = _enc_pwd(password)
-    else:
+    with _SETTINGS_LOCK:
+        s = _load_settings()
+        accs = s.get("accounts") or {}
+        rec = dict(accs.get(email) or {})
+        if "order" not in rec:
+            rec["order"] = len(accs)
+        # 无论调用方是否传 auth，都清掉旧版密码字段。
         rec.pop("password_b64", None)
-    if toggles is not None:
-        rec["toggles"] = toggles
-    if params is not None:
-        rec["params"] = params
-    accs[email] = rec
-    s["accounts"] = accs
-    _save_settings(s)
+        rec.pop("save_pwd", None)
+        rec.pop("password", None)
+        if auth is not _AUTH_UNSET:
+            if auth:
+                rec["auth_blob"] = _protect_auth(email, auth)
+            else:
+                rec.pop("auth_blob", None)
+        if toggles is not None:
+            rec["toggles"] = toggles
+        if params is not None:
+            rec["params"] = params
+        accs[email] = rec
+        s["accounts"] = accs
+        if not _save_settings(s):
+            raise RuntimeError("无法保存账号设置，请检查数据目录写入权限")
 
 
 def delete_account(email: str) -> None:
-    s = _load_settings()
-    accs = s.get("accounts") or {}
-    if email in accs:
-        del accs[email]
-        s["accounts"] = accs
-        _save_settings(s)
+    with _SETTINGS_LOCK:
+        s = _load_settings()
+        accs = s.get("accounts") or {}
+        if email in accs:
+            del accs[email]
+            s["accounts"] = accs
+            if not _save_settings(s):
+                raise RuntimeError("无法删除账号设置，请检查数据目录写入权限")
 
 
 # ---------- 助战收藏夹 ----------
@@ -240,33 +333,19 @@ def _update_support_favs(email: str, op, skip_save=None) -> None:
     _save_settings(s)
 
 
-# ---------- EROLABS 门户 ----------
-# 三个入口指向**同一个后端**(实测 /api/v2/config/turnstileSiteKey 返回同一个
-# Turnstile key 0x4AAAAAACArc0cJVkc8ZTET，登录页表单字段 ID 也完全一致)。
-#   game.ero-labs.art  —— **当前默认**，实测可直连(curl 无代理 HTTP 200)
-#   game.ero-labs.tech —— 上一个入口，2026-08-10 起 302 跳到 .art（页面和 API 都跳）
-#   www.ero-labs.com   —— 最早的入口，本机需走代理才通
-# 站点的 baseUrl 在页面 JS 里是相对路径 "../api"，所以 API base = 站点根 + /api。
-#
-# ⚠️ 上游换过两次址(.com → .tech → .art)，**别指望靠 302 兜着**：多一跳会吃掉
-# Playwright 的 goto 预算(源站本身就慢且抖，实测同一 HTML 1.4s~17.3s)，2026-08-10
-# 桌面辅助登录就是这么超时崩的。换址时改这里一处，别留着让重定向顶。
-PORTAL_SITE_ART = "https://game.ero-labs.art"
-PORTAL_SITE_TECH = "https://game.ero-labs.tech"   # 旧入口：现 302 → .art
-PORTAL_SITE_COM = "https://www.ero-labs.com"      # 最早入口：需代理
-
-PORTAL_SITE = PORTAL_SITE_ART
-PORTAL_BASE = f"{PORTAL_SITE}/api"
-PORTAL_LOGIN = f"{PORTAL_BASE}/v2/login"
-PORTAL_USERINFO = f"{PORTAL_BASE}/v2/accountManagement/userInfo"
-PORTAL_LOGIN_PAGE = f"{PORTAL_SITE}/cn/login.html"
-PORTAL_HOME_PAGE = f"{PORTAL_SITE}/cn/index.html"
-TURNSTILE_SITE_KEY = "0x4AAAAAACArc0cJVkc8ZTET"
-
-# 门户是否需要代理：新入口可直连，走代理反而多一跳(且用户代理不一定开着)。
-# 用"可直连集合"而不是跟某一个站点比——再加入口时往集合里塞即可，不用改判断。
-PORTAL_SITES_DIRECT = {PORTAL_SITE_ART, PORTAL_SITE_TECH}
-PORTAL_NEEDS_PROXY = PORTAL_SITE not in PORTAL_SITES_DIRECT
+# ---------- EROLABS V2 门户 ----------
+# 当前先实现已由 Android 客户端和 Postie 双重确认的 V2 地址；允许环境变量覆盖，便于
+# 上游换域名时先热修。后续 DomainResolver 会把远程配置和健康检查接到这里。
+PORTAL_V2_SITE = os.environ.get(
+    "ARK_PORTAL_V2", "https://sadpki-portal-v2.ebuajk.com"
+).rstrip("/")
+PORTAL_V2_CAPTCHA = f"{PORTAL_V2_SITE}/api/v2/captcha/verify"
+PORTAL_V2_LOGIN = f"{PORTAL_V2_SITE}/api/v2/account/login"
+PORTAL_V2_REFRESH = f"{PORTAL_V2_SITE}/api/v2/token/access"
+EROLABS_GAME_ID = 32
+PORTAL_CAPTCHA_TIMEOUT = 45.0
+PORTAL_LOGIN_TIMEOUT = 60.0
+PORTAL_REFRESH_TIMEOUT = 30.0
 
 # 游戏后端(Ark Re:Code)
 GAME_ROUTER = "https://game-arkre-labs.ecchi.xxx/Router/RouterHandler.ashx"
@@ -274,8 +353,8 @@ GAME_ORIGIN = "https://game-arkre-labs.ecchi.xxx"
 GAME_REFERER = "https://game-arkre-labs.ecchi.xxx/WebGL/index.html"
 GAME_VERSION = "4.0.0.111888"
 
-# 登录握手 common 参数
-LOGIN_COMMON = {
+# 旧 WebGL 握手仍保留给显式的 legacy token 入口；新默认登录使用 Android V2 profile。
+LOGIN_COMMON_WEBGL = {
     "GuestID": "",
     "Platform": "WebGLPlayer",
     "Version": GAME_VERSION,
@@ -283,6 +362,18 @@ LOGIN_COMMON = {
     "LoginType": "Erolabs",
     "IsNewSDK": 0,
 }
+LOGIN_COMMON = LOGIN_COMMON_WEBGL  # 兼容现有内部调用和测试
+
+
+def android_login_common(device_id: str) -> dict:
+    return {
+        "GuestID": "",
+        "Platform": "Android",
+        "Version": GAME_VERSION,
+        "DeviceID": device_id,
+        "LoginType": "Erolabs",
+        "IsNewSDK": 1,
+    }
 
 HTTP_TIMEOUT = 30.0
 
@@ -292,7 +383,7 @@ HTTP_TIMEOUT = 30.0
 # 入口靠**口令**解锁：设置页底部一个无提示输入框，输对口令才显示控制台。
 # （原先是绑定测试账号白名单，换成口令后不再与某个具体账号耦合。）
 # ⚠️ 口令必须在**后端**校验：本工具会打包成 exe/APK 分发，光靠前端隐藏入口等于
-# 没有限制——任何能访问 localhost:8000 的人都能直接 POST /api/dev/call。
+# 没有限制——任何能访问 localhost:27843 的人都能直接 POST /api/dev/call。
 # 故 /api/dev/call 每次都要带上口令，由这里判定；前端不写死口令（真源只此一处）。
 DEV_PASSPHRASE = "openrubi"
 

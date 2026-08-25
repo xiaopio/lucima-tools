@@ -11,8 +11,6 @@
   backend 里的 json（物品名/装备表/活动名/稀有度）都靠 open(dirname(__file__)/x.json)
   读取，冻结后落 _MEIPASS/backend/，所以必须整目录打进去——漏一个就静默退化
   （曾漏 item_names.json 导致 exe 里物品名全变 "道具#ID"，源码启动却正常）。
-- Playwright 用 channel="msedge" 复用系统 Edge，不打包 Chromium，
-  但需带上 playwright 的 node driver（collect_all）。
 - pywebview 用系统 WebView2（Win10/11 自带 Edge 运行时）。
 """
 import glob
@@ -32,12 +30,11 @@ assert any(p.endswith("item_names.json") for p, _ in datas), "backend/item_names
 binaries = []
 hiddenimports = collect_submodules("backend")
 
-# Playwright 驱动 + 数据
-for pkg in ("playwright", "webview"):
-    d, b, h = collect_all(pkg)
-    datas += d
-    binaries += b
-    hiddenimports += h
+# pywebview 运行时数据
+d, b, h = collect_all("webview")
+datas += d
+binaries += b
+hiddenimports += h
 
 block_cipher = None
 

@@ -96,8 +96,7 @@ chaquopy {
 // ---------- 构建前把共享源复制进来（单一真源在项目根，不重复维护） ----------
 val copyBackend = tasks.register<Sync>("copyBackendPython") {
     from(File(projectRoot, "backend")) {
-        // Playwright 登录仅供 Windows 使用，不进入 Android 包。
-        exclude("__pycache__/**", "browser_login.py")
+        exclude("__pycache__/**")
     }
     into(layout.projectDirectory.dir("src/main/python/backend"))
 }
@@ -123,7 +122,5 @@ dependencies {
     implementation("androidx.core:core-ktx:1.12.0")
     implementation("androidx.appcompat:appcompat:1.6.1")
     implementation("com.google.android.material:material:1.11.0")
-    // WebView 代理支持（ProxyController）
-    implementation("androidx.webkit:webkit:1.11.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
 }

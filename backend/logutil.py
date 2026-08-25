@@ -10,15 +10,48 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from typing import Any
 
 from . import config
 
 _LOG_DIR = Path(config._DATA_DIR) / "logs"
 LOG_FILE = _LOG_DIR / "app.log"
+
+REDACTED = "[REDACTED]"
+
+# Credential/session fields are retained structurally but never with values.
+_REDACT_KEYS = frozenset({
+    "aid", "sessionid", "token", "accesstoken", "refreshtoken",
+    "password", "password_b64", "authorization", "cookie", "set-cookie",
+    "proxy-authorization",
+})
+
+
+def redact(value: Any) -> Any:
+    """Recursively redact credential/session fields before writing a trace."""
+    if isinstance(value, dict):
+        return {
+            key: REDACTED if str(key).casefold() in _REDACT_KEYS else redact(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(redact(item) for item in value)
+    return value
+
+
+def format_payload(value: Any) -> str:
+    """Serialize a redacted payload without truncating its contents."""
+    safe = redact(value)
+    if isinstance(safe, (dict, list, tuple)):
+        return json.dumps(safe, ensure_ascii=False, separators=(",", ":"))
+    return str(safe)
 
 _configured = False
 

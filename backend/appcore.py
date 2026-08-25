@@ -8,17 +8,25 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from pathlib import Path
 
 from . import config
 from . import accounts
 from .logutil import log
 from .game_client import GameClient, GameError
-from .portal import portal_login, PortalError
+from .portal import (
+    PortalError, access_token_expires_at, access_token_needs_refresh,
+    portal_login_v2, portal_refresh_v2,
+)
 from .tasks import (
     TASKS, run_task, run_auto_tasks, run_toggle_tasks, toggle_tasks, manual_tasks,
-    shop_reset, shop_buy_index, UnknownEquipmentError,
-    HUNT_SWEEP_CANDIDATES, SWEEP_KINDS, list_teams, sweep_once, next_claim_times,
+    shop_reset, shop_buy_index, star_source_query, star_source_refresh, star_source_buy,
+    customized_equip_query, customized_equip_choose_set, customized_equip_choose_part,
+    customized_equip_choose_main, customized_equip_reset, customized_equip_refresh,
+    customized_equip_choose_sub, customized_equip_reward, UnknownEquipmentError,
+    HUNT_ELEMENTS, HUNT_SWEEP_CANDIDATES, SWEEP_KINDS, hunt_sweep_scenes,
+    list_teams, sweep_once, next_claim_times,
     activity_scenes, query_support_friends, activity_once,
     support_brief, trim_support_entry,
     store_shelves, store_buy,
@@ -57,6 +65,7 @@ CURRENCY_IDS = {
     "recruit": "5",   # 绿票 招募契约
     "mystery": "6",   # 黄票 神秘契约
     "galaxy": "7",    # 银河契约（月签到第28天奖励，实抓确认）
+    "battery": "37",  # 能源电池
 }
 
 _AVATAR_INDEX: dict[str, str] | None = None
@@ -114,6 +123,7 @@ def summarize(state: dict) -> dict:
         "currencies": {
             "gold": count(CURRENCY_IDS["gold"]),
             "diamond": count(CURRENCY_IDS["diamond"]),
+            "battery": count(CURRENCY_IDS["battery"]),
             "recruit": count(CURRENCY_IDS["recruit"]),
             "mystery": count(CURRENCY_IDS["mystery"]),
             "galaxy": count(CURRENCY_IDS["galaxy"]),
@@ -129,6 +139,8 @@ def summarize(state: dict) -> dict:
 GRADE_BY_IMPRINT = {1: "D", 2: "C", 3: "B", 4: "A", 5: "S", 6: "SS", 7: "SSS"}
 
 _ITEM_RANK: dict | None = None
+_ITEM_CATEGORY: dict | None = None
+_ROLE_ELEMENT: dict | None = None
 
 
 def _item_rank() -> dict:
@@ -143,14 +155,57 @@ def _item_rank() -> dict:
     return _ITEM_RANK
 
 
+def _item_category() -> dict:
+    """读取由官方 sd_Item 表生成的 StaticID -> 物品页分类索引。"""
+    global _ITEM_CATEGORY
+    if _ITEM_CATEGORY is None:
+        p = ASSETS_DIR / "item_categories.json"
+        try:
+            _ITEM_CATEGORY = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            _ITEM_CATEGORY = {}
+    return _ITEM_CATEGORY
+
+
+def _item_category_fallback(sid: str) -> str:
+    """兼容未带分类索引的旧资源包；新资源以官方数据表生成结果为准。"""
+    if sid == "38" or sid.startswith(("EC", "AC", "UEC", "UAC")):
+        return "enhancement"
+    if sid == "74" or (sid.startswith("R") and sid[1:].isdigit()):
+        return "element"
+    if sid.startswith("CR"):
+        return "crystal"
+    if sid.startswith("AH"):
+        return "activity"
+    if sid.startswith("C") and sid[1:].isdigit():
+        return "catalyst"
+    if sid.isdigit():
+        return "wealth"
+    return "other"
+
+
+def _role_element() -> dict:
+    """读取由官方 sd_Role 表生成的角色 StaticID -> 属性索引。"""
+    global _ROLE_ELEMENT
+    if _ROLE_ELEMENT is None:
+        p = ASSETS_DIR / "role_elements.json"
+        try:
+            _ROLE_ELEMENT = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            _ROLE_ELEMENT = {}
+    return _ROLE_ELEMENT
+
+
 def _roster(state: dict) -> dict:
     """从登录快照抽取团员与物品清单，供基本信息页展示。
 
     团员来自 RoleDataContainer.Roles；物品来自 ItemContainer.Items，
-    但排除已在顶部单独展示的 7 种货币（金币/钻石/能源/旗帜/招募/神秘/银河），
+    但排除已在顶部单独展示的资源（金币/钻石/能源电池/能源/旗帜/招募/神秘/银河），
     避免与顶部资产列重复。
     """
     rank = _item_rank()
+    category = _item_category()
+    elements = _role_element()
 
     heroes = []
     for r in state.get("RoleDataContainer", {}).get("Roles", []):
@@ -163,6 +218,7 @@ def _roster(state: dict) -> dict:
             "imprint": imp,
             "grade": GRADE_BY_IMPRINT.get(imp, ""),
             "avatar": avatar_url(sid),
+            "element": elements.get(sid),
             "star": r.get("Star"),
             "awaken": r.get("AwakenLV"),
         })
@@ -181,6 +237,7 @@ def _roster(state: dict) -> dict:
             "name": item_name(sid),
             "count": it.get("Count", 0),
             "rank": rank.get(sid, 0),
+            "category": category.get(sid) or _item_category_fallback(sid),
         })
     # 排序：稀有度高在前，同稀有度按 ID
     items.sort(key=lambda i: (-(i["rank"] or 0), i["id"]))
@@ -201,15 +258,66 @@ def roster(account: str) -> dict:
 
 
 # ---------- bootstrap / 登录 ----------
-def _bootstrap_and_register(email: str, game_token: str, portal: dict | None) -> accounts.Account:
-    """用 token 建立游戏会话 → 登记为在线账号 → 启动其后台调度线程。返回 Account。"""
-    client = GameClient(game_token)
+_AUTH_REFRESH_LOCKS: dict[str, threading.Lock] = {}
+_AUTH_REFRESH_LOCKS_GUARD = threading.Lock()
+
+
+def _auth_refresh_lock(email: str) -> threading.Lock:
+    with _AUTH_REFRESH_LOCKS_GUARD:
+        return _AUTH_REFRESH_LOCKS.setdefault(email, threading.Lock())
+
+
+def _auth_version(auth: dict) -> tuple[float, int]:
+    return (
+        access_token_expires_at(str(auth.get("access_token") or "")) or 0.0,
+        int(auth.get("saved_at") or 0),
+    )
+
+
+def _refresh_account_auth(email: str, auth: dict, force: bool = False) -> dict:
+    """按需续期并原子覆盖安全存储；同一账号并发请求只允许一个进入门户。"""
+    if not force and not access_token_needs_refresh(str(auth.get("access_token") or "")):
+        return auth
+    with _auth_refresh_lock(email):
+        latest = (config.load_accounts().get(email) or {}).get("auth")
+        if latest and latest.get("access_token") != auth.get("access_token"):
+            latest_is_usable = not access_token_needs_refresh(
+                str(latest.get("access_token") or "")
+            )
+            if latest_is_usable and _auth_version(latest) >= _auth_version(auth):
+                auth.clear()
+                auth.update(latest)
+                return auth
+        if not force and not access_token_needs_refresh(str(auth.get("access_token") or "")):
+            return auth
+        refreshed = portal_refresh_v2(auth)
+        # Refresh Token 通常会轮换，必须先安全落盘再让运行中的客户端采用新值。
+        config.save_account(email, auth=refreshed)
+        auth.clear()
+        auth.update(refreshed)
+        log.info("账号 %s 的登录令牌已无感续期", email)
+        return auth
+
+
+def _bootstrap_and_register(email: str, auth: dict) -> accounts.Account:
+    """用 V2 Token 建立游戏会话并登记在线账号。"""
+    client = GameClient(
+        auth["access_token"],
+        login_id=auth["user_id"],
+        login_common=config.android_login_common(auth["device_id"]),
+        auth_refresher=lambda force=False: _refresh_account_auth(email, auth, force),
+    )
     try:
         client.bootstrap()
+    except PortalError as e:
+        client.close()
+        log.warning("账号 %s 登录凭证续期失败: %s", email, e)
+        raise ApiError(401, "登录凭证已过期，请重新输入密码登录")
     except Exception as e:
+        client.close()
         log.exception("游戏 bootstrap 失败: %s", e)
         raise ApiError(400, f"游戏登录失败: {e}")
-    return accounts.add(email, client, portal)
+    return accounts.add(email, client, {"userId": auth["user_id"]})
 
 
 def _account_payload(acc: accounts.Account, auto_results: list | None = None) -> dict:
@@ -241,77 +349,45 @@ def _require(account: str | None) -> accounts.Account:
 
 
 # ---------- 端点处理（平台无关） ----------
-def login(account: str, password: str, save_pwd: bool = False) -> dict:
-    """辅助登录（Windows：Playwright 弹 Edge 手点验证码）。Android 不走这里。
-
-    密码为空时回退用存档里保存的密码（前端选了"已保存账号"就不必再输密码）。
-    """
+def login(account: str, password: str) -> dict:
+    """精简 V2 登录。密码仅用于本次请求，成功后只持久化加密 Token。"""
     account = (account or "").strip()
     if not account:
         raise ApiError(400, "账号不能为空")
     if not password:
-        saved = config.load_accounts().get(account, {})
-        if saved.get("password"):
-            password = saved["password"]
-            save_pwd = True   # 用存档密码登录 → 保持已保存
-        else:
-            raise ApiError(400, "请输入密码")
+        raise ApiError(400, "请输入密码，或使用该账号已保存的 Token 登录")
     try:
-        from .browser_login import interactive_portal_login, BrowserLoginError
-    except Exception as e:
-        raise ApiError(500, f"辅助登录不可用（缺少 Playwright）：{e}")
-    try:
-        p = interactive_portal_login(account, password)
-    except BrowserLoginError as e:
-        log.warning("辅助登录失败: %s", e)
-        raise ApiError(400, f"{e}")
-    except Exception as e:
-        log.exception("辅助登录异常: %s", e)
-        raise ApiError(500, f"辅助登录出错：{e}")
-    acc = _bootstrap_and_register(account, p["jwt"], portal={"account": account})
-    config.save_account(account, password=password, save_pwd=save_pwd)
-    auto = _run_login_tasks(acc)
-    return _account_payload(acc, auto_results=auto)
-
-
-def login_direct(account: str, password: str, turnstile_token: str | None,
-                 save_pwd: bool = False) -> dict:
-    account = (account or "").strip()
-    try:
-        p = portal_login(account, password, turnstile_token)
+        auth = portal_login_v2(account, password, config.get_device_id())
     except PortalError as e:
-        raise ApiError(400, f"门户登录失败: {e}")
-    acc = _bootstrap_and_register(account, p["jwt"], portal=p)
-    config.save_account(account, password=password, save_pwd=save_pwd)
+        log.warning("V2 门户登录失败: %s", e)
+        raise ApiError(400, f"门户登录失败：{e}")
+    acc = _bootstrap_and_register(account, auth)
+    try:
+        config.save_account(account, auth=auth)
+    except Exception as e:
+        accounts.remove(account)
+        log.exception("账号 %s 的登录 Token 无法安全保存: %s", account, e)
+        raise ApiError(500, f"登录令牌无法安全保存：{e}")
     auto = _run_login_tasks(acc)
     return _account_payload(acc, auto_results=auto)
 
 
-def login_token(game_token: str, account: str | None = None,
-                password: str = "", save_pwd: bool = False) -> dict:
-    """直接用 erolabsjwt bootstrap。Android 端 WebView 拿到 cookie 后走这里。
-    account 缺省时用一个占位 email。
-
-    与桌面 login()/login_direct() 对齐：登录成功后调 config.save_account 把账号
-    写进存档注册表（这样登录页"已保存账号"下拉里才有它、退出后仍可选），save_pwd
-    为真则同时保存密码。此前 Android 路径漏了这步，导致密码不保存、账号无法复选。
-    """
-    email = (account or "").strip() or "android"
-    acc = _bootstrap_and_register(email, game_token, portal=None)
-    if email != "android":   # 占位账号不写存档
-        config.save_account(email, password=password, save_pwd=save_pwd)
+def login_saved(account: str) -> dict:
+    """使用本机安全存储中的 V2 Token 恢复游戏会话。"""
+    account = (account or "").strip()
+    if not account:
+        raise ApiError(400, "账号不能为空")
+    record = config.load_accounts().get(account)
+    if not record:
+        raise ApiError(404, "没有找到该账号的本地登录凭证")
+    if record.get("auth_error"):
+        raise ApiError(401, "本地 Token 无法解密，请重新输入密码登录")
+    auth = record.get("auth")
+    if not auth:
+        raise ApiError(401, "该账号没有已保存的 Token，请重新输入密码登录")
+    acc = _bootstrap_and_register(account, auth)
     auto = _run_login_tasks(acc)
     return _account_payload(acc, auto_results=auto)
-
-
-def saved_password(account: str) -> str:
-    """取某账号存档里保存的明文密码（供 Android 登录 WebView 自动填表用）。
-
-    前端只知道 hasPwd 布尔，拿不到明文（明文只在 settings.json）；Android 选
-    "已保存账号"重登时密码框为空，Kotlin 需据此取回真实密码填 ero-labs 表单。
-    """
-    rec = config.load_accounts().get((account or "").strip(), {})
-    return rec.get("password") or ""
 
 
 def _run_login_tasks(acc: accounts.Account) -> list:
@@ -353,8 +429,8 @@ def list_accounts() -> dict:
         item = {
             "account": email,
             "online": acc is not None,
-            "savePwd": bool(rec.get("save_pwd")),
-            "hasPwd": bool(rec.get("save_pwd") and rec.get("password")),
+            "hasToken": bool(rec.get("auth")),
+            "tokenError": bool(rec.get("auth_error")),
         }
         if acc:
             st = summarize(acc.client.account_state or {})
@@ -365,7 +441,14 @@ def list_accounts() -> dict:
             item["params"] = acc.params
             item["logSeq"] = acc.log_seq
         items.append(item)
-    return {"accounts": items}
+    return {"accounts": items, "autoRestore": config.TEST_SERVER}
+
+
+def restore_account(account: str) -> dict:
+    """Return an already-live in-memory account without logging in again."""
+    if not config.TEST_SERVER:
+        raise ApiError(404, "该接口仅供 start.bat 测试模式使用")
+    return _account_payload(_require(account))
 
 
 def logout(account: str) -> dict:
@@ -375,7 +458,7 @@ def logout(account: str) -> dict:
 
 
 def delete_account(account: str) -> dict:
-    """删除账号：下线 + 清除存档（密码/开关）。"""
+    """删除账号：下线 + 清除加密 Token、开关和其他账号设置。"""
     accounts.remove(account)
     config.delete_account(account)
     return {"ok": True}
@@ -428,7 +511,7 @@ def status(account: str) -> dict:
     acc = accounts.get(account or "")
     if not acc or not acc.client.account_state:
         raise ApiError(401, "账号未登录")
-    # 带上竞技场档期：前端后台轮询(每 8s 有新巡检日志时)据此刷新展开页的倒计时，
+    # 带上竞技场档期：前端后台轮询有新巡检日志时据此刷新展开页的倒计时，
     # 让后台扫荡完成后"下次挑战时间"自动跟上。不塞进 _status_snapshot——那个还被
     # 刷商店/扫荡的响应复用，没必要每次操作都捎带这份。
     return {**_status_snapshot(acc), "arena": arena_state(acc)}
@@ -444,6 +527,7 @@ def refresh_status(account: str) -> dict:
     try:
         with acc.lock:
             state = acc.client.bootstrap()
+            acc.note_state_refreshed()
     except Exception as e:
         log.exception("刷新（重登）失败: %s", e)
         raise ApiError(400, f"刷新失败: {e}")
@@ -555,10 +639,13 @@ def run(account: str, task_ids: list[str], params: dict) -> dict:
     return {"results": results}
 
 
-def shop_reset_ep(account: str, use_gold: bool, auto_buy: list[str]) -> dict:
+def shop_reset_ep(account: str, use_gold: bool, auto_buy: list[str],
+                  equipment_scheme: dict | None = None) -> dict:
     acc = _require(account)
+    if equipment_scheme is not None and not isinstance(equipment_scheme, dict):
+        raise ApiError(400, "装备筛选方案格式无效")
     with acc.lock:
-        r = shop_reset(acc.client, use_gold, auto_buy)
+        r = shop_reset(acc.client, use_gold, auto_buy, equipment_scheme)
     acc.shop_shelf = r.get("records", [])
     out = {k: v for k, v in r.items() if k != "records"}
     out.update(_status_snapshot(acc))   # 带回最新货币/资源，前端每次刷新后即时更新主页
@@ -576,6 +663,67 @@ def shop_buy_ep(account: str, index: int) -> dict:
                             f"无法解析——请补充 backend/equip_ref.json")
     r.update(_status_snapshot(acc))
     return r
+
+
+def star_source_refresh_ep(account: str, scheme: dict) -> dict:
+    acc = _require(account)
+    if not isinstance(scheme, dict):
+        raise ApiError(400, "筛选方案格式无效")
+    try:
+        with acc.lock:
+            r = star_source_refresh(acc.client, scheme)
+    except UnknownEquipmentError as e:
+        raise ApiError(
+            422,
+            f"装备 StaticID={e.static_id} 不在图鉴数据中，无法执行筛选——请补充 backend/equip_ref.json",
+        )
+    r.update(_status_snapshot(acc))
+    return r
+
+
+def star_source_buy_ep(account: str, shop_index: int) -> dict:
+    acc = _require(account)
+    with acc.lock:
+        result = star_source_buy(acc.client, shop_index)
+    result.update(_status_snapshot(acc))
+    return result
+
+
+def star_source_query_ep(account: str) -> dict:
+    acc = _require(account)
+    with acc.lock:
+        r = star_source_query(acc.client)
+    r.update(_status_snapshot(acc))
+    return r
+
+
+def customized_equip_ep(account: str, action: str, body: dict) -> dict:
+    acc = _require(account)
+    actions = {
+        "query": lambda: customized_equip_query(acc.client, body.get("scheme")),
+        "chooseSet": lambda: customized_equip_choose_set(acc.client, str(body.get("set") or "")),
+        "choosePart": lambda: customized_equip_choose_part(acc.client, str(body.get("part") or "")),
+        "chooseMain": lambda: customized_equip_choose_main(
+            acc.client, str(body.get("part") or ""), str(body.get("main") or ""),
+        ),
+        "reset": lambda: customized_equip_reset(acc.client, str(body.get("level") or "")),
+        "refresh": lambda: customized_equip_refresh(acc.client, body.get("scheme")),
+        "chooseSub": lambda: customized_equip_choose_sub(acc.client, bool(body.get("accept"))),
+        "reward": lambda: customized_equip_reward(acc.client),
+    }
+    callback = actions.get(str(action or ""))
+    if callback is None:
+        raise ApiError(400, "无效的装备活动操作")
+    try:
+        with acc.lock:
+            result = callback()
+    except UnknownEquipmentError as error:
+        raise ApiError(
+            422,
+            f"装备 StaticID={error.static_id} 不在图鉴数据中，无法执行筛选——请补充 backend/equip_ref.json",
+        )
+    result.update(_status_snapshot(acc))
+    return result
 
 
 def store_options(account: str) -> dict:
@@ -606,8 +754,13 @@ def store_buy_ep(account: str, picks: list[dict]) -> dict:
 
 def sweep_options(account: str, kind: str = "hunt") -> dict:
     acc = _require(account)
-    scenes = SWEEP_KINDS.get(kind, HUNT_SWEEP_CANDIDATES)
-    return {"scenes": scenes, "teams": list_teams(acc.client)}
+    if kind == "hunt":
+        scenes = hunt_sweep_scenes(acc.client.account_state or {})
+        elements = [{"id": row["id"], "name": row["name"]} for row in HUNT_ELEMENTS]
+    else:
+        scenes = SWEEP_KINDS.get(kind, HUNT_SWEEP_CANDIDATES)
+        elements = []
+    return {"elements": elements, "scenes": scenes, "teams": list_teams(acc.client)}
 
 
 def sweep_run(account: str, scene_id: str, team_id: str, quick_battle: bool = True) -> dict:
@@ -630,7 +783,7 @@ def _decorate_support(brief: dict) -> dict:
 
 
 def activity_options(account: str) -> dict:
-    """活动关卡选项：当期关卡族 + 队伍 + 助战好友 + 助战收藏夹。
+    """活动关卡选项：当期全部已解锁关卡 + 队伍 + 助战好友 + 助战收藏夹。
 
     助战列表原始条目缓存到 Account.support_cache 供 activity_run 构建 payload。
     收藏夹(按账号存，见 config.load_support_favs)里的人**即使已不在助战列表**也照样
@@ -719,7 +872,6 @@ def get_config() -> dict:
     pc = config.get_proxy_config()
     return {
         "version": config.APP_VERSION,      # 关于页版本徽章（前端不写死，见 backend/version.py）
-        "turnstileSiteKey": config.TURNSTILE_SITE_KEY,
         "platform": config.PLATFORM,
         "proxyMode": pc["mode"],
         "proxy": pc["manual"],
@@ -735,6 +887,15 @@ def dev_unlock(passphrase: str | None) -> dict:
     输错了什么都不发生。
     """
     return {"ok": config.check_dev_pass(passphrase)}
+
+
+def dev_request_history(account: str, passphrase: str | None = None) -> dict:
+    """Return the account's five newest replayable game requests."""
+    if not config.check_dev_pass(passphrase):
+        raise ApiError(403, "开发者模式未解锁")
+    acc = _require(account)
+    getter = getattr(acc.client, "recent_requests", None)
+    return {"history": getter(5) if callable(getter) else []}
 
 
 def dev_call(account: str, route: str, data: dict | None, use_auth: bool = True,

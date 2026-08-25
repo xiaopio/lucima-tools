@@ -42,6 +42,10 @@ LucimaTools is an open-source project built to reduce the daily grind for *Ark R
 
 Download the release for your platform and run it directly.
 
+Your password is used only to obtain a login token and is never stored on disk. The token is
+protected by Windows DPAPI or Android Keystore. After a restart, choose the saved account from
+the account dropdown and click Login to restore the session without entering the password again.
+
 ### Developer Build
 
 The project uses Python 3.12. The Windows desktop build also requires the system Edge / WebView2 runtime; Android builds require JDK 17, the Android SDK, and NDK 26. Installing dependencies in a virtual environment is recommended:

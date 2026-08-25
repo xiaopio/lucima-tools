@@ -25,6 +25,7 @@ logs/
 # ===================== 构建产物 =====================
 build/
 dist/
+debug/
 *.spec.bak
 __pycache__/
 *.py[cod]

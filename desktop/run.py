@@ -2,7 +2,7 @@
 
 - 后台线程起标准库 HTTP 服务（backend.server）
 - 主线程用 pywebview 弹出独立原生窗口，加载本地服务的前端界面
-- 登录时由 backend 的 Playwright 辅助登录弹 Edge 让用户点验证码
+- 登录由 Python 后端直接调用 EROLABS V2 JSON API
 
 PyInstaller 打包后即为单个 LucimaTools.exe，双击运行。
 """
@@ -38,9 +38,10 @@ os.environ.setdefault("ARK_PLATFORM", "windows")
 import webview  # noqa: E402
 
 from backend import server  # noqa: E402
+from backend.updater import mark_launch_success  # noqa: E402
 
 
-def _free_port(preferred: int = 8000) -> int:
+def _free_port(preferred: int = server.DEFAULT_PORT) -> int:
     """优先用 preferred 端口，被占用则让系统分配一个空闲端口。"""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
@@ -60,7 +61,7 @@ def _start_server(port: int):
 
 
 def main():
-    port = _free_port(8000)
+    port = _free_port()
     _start_server(port)
     # 等服务器起来
     time.sleep(0.4)
@@ -73,6 +74,7 @@ def main():
         min_size=(900, 640),
         text_select=True,  # pywebview 默认 False（禁止选中）——显式打开以便复制页面文字
     )
+    mark_launch_success()
     webview.start()  # 阻塞至窗口关闭
 
 

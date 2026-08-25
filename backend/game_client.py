@@ -10,12 +10,15 @@ from __future__ import annotations
 
 import gzip
 import json
-from typing import Any
+import threading
+import time
+from collections import deque
+from typing import Any, Callable
 
 import httpx
 
 from . import config
-from .logutil import log
+from .logutil import format_payload, log
 
 # 要把完整请求/响应体写进开发者日志的 route（花资源、需要事后核对真实价格与
 # 服务器裁决的操作）。其余 route 不记——巡检每 5 分钟一轮，全记会把日志刷爆。
@@ -61,6 +64,20 @@ def _distill(body: dict) -> str:
             + f"  · 其余键: {other}" + _shelf_digest(body))
 
 
+_LOGIN_ROUTES = frozenset({
+    "ErolabsHandler.QueryUserID",
+    "AccountHandler.Login",
+})
+
+
+def _log_game_response(route: str, status: int, body: Any, *, login: bool) -> None:
+    """Log ordinary responses in full; login responses only get metadata."""
+    if login:
+        log.info("[game<-] %s HTTP %s response body suppressed (login)", route, status)
+    else:
+        log.info("[game<-] %s HTTP %s %s", route, status, format_payload(body))
+
+
 class GameError(Exception):
     """游戏后端返回的业务错误。"""
 
@@ -87,15 +104,45 @@ _HEADERS = {
 
 
 class GameClient:
-    def __init__(self, game_token: str):
-        # game_token = 门户的 erolabsjwt，也是 WebGL 客户端 ?token= 的值
+    def __init__(self, game_token: str, *, login_id: str | None = None,
+                 login_common: dict | None = None,
+                 auth_refresher: Callable[[bool], dict] | None = None):
+        # game_token 可以是旧 WebGL jwt，也可以是 V2 accessToken；由登录 profile 决定。
         self.game_token = game_token
+        self._fixed_login_id = login_id
+        self._login_common = dict(login_common or config.LOGIN_COMMON_WEBGL)
+        self._auth_refresher = auth_refresher
         self.login_id: str | None = None
         self.aid: str | None = None
         self.session_id: str | None = None
         self.account_state: dict[str, Any] | None = None
         self._proxy: str = config.get_proxy()  # 当前 client 使用的代理
         self._client = self._build_client(self._proxy)
+        self._request_history: deque[dict[str, Any]] = deque(maxlen=5)
+        self._request_history_lock = threading.Lock()
+        self._request_history_seq = 0
+
+    def _sync_login_auth(self, force: bool = False) -> None:
+        """在登录握手前同步安全存储中的 V2 Token，不向调用方暴露凭证。"""
+        if not self._auth_refresher:
+            return
+        auth = self._auth_refresher(force)
+        access_token = str(auth.get("access_token") or "")
+        user_id = str(auth.get("user_id") or "")
+        device_id = str(auth.get("device_id") or "")
+        if not access_token or not user_id or not device_id:
+            raise GameError("续期后的登录凭证不完整")
+        self.game_token = access_token
+        self._fixed_login_id = user_id
+        self._login_common = config.android_login_common(device_id)
+
+    @staticmethod
+    def _looks_like_auth_failure(error: GameMessage) -> bool:
+        message = str(error.msg or "").lower()
+        return any(marker in message for marker in (
+            "getuserid", "erolabshandler.login", "invalid token",
+            "token expired", "no token", "unauthorized",
+        ))
 
     @staticmethod
     def _build_client(proxy: str) -> httpx.Client:
@@ -121,15 +168,49 @@ class GameClient:
             self._client = self._build_client(cur)
 
     # ---- 底层调用 ----
+    def record_request(self, route: str, data: dict | None = None) -> None:
+        """Keep a small replayable request history without login/session secrets."""
+        route = str(route or "").strip()
+        if not route or route in _LOGIN_ROUTES:
+            return
+        source = data if isinstance(data, dict) else {}
+        use_auth = "AID" in source or "SessionID" in source
+        replay_data = {
+            key: value for key, value in source.items()
+            if key not in {"AID", "SessionID"}
+        }
+        # Request bodies have already passed through JSON serialization in normal
+        # calls. Round-tripping here gives the history an immutable snapshot.
+        replay_data = json.loads(json.dumps(replay_data, ensure_ascii=False))
+        with self._request_history_lock:
+            self._request_history_seq += 1
+            self._request_history.append({
+                "id": self._request_history_seq,
+                "route": route,
+                "data": replay_data,
+                "useAuth": use_auth,
+                "timestamp": int(time.time() * 1000),
+            })
+
+    def recent_requests(self, limit: int = 5) -> list[dict[str, Any]]:
+        """Return newest-first snapshots for the gated developer console."""
+        count = max(0, min(5, int(limit or 5)))
+        with self._request_history_lock:
+            rows = list(reversed(self._request_history))[:count]
+            return json.loads(json.dumps(rows, ensure_ascii=False))
+
     def call(self, route: str, data: dict | None = None) -> dict:
         """调用一个 route，返回解压后的 JSON dict。"""
         self._sync_proxy()
         payload = {"data": data or {}, "route": route}
         body = json.dumps(payload).encode("utf-8")
-        trace = route in _TRACE_ROUTES
-        if trace:
-            log.info("[game→] %s %s", route,
-                     json.dumps(payload["data"], ensure_ascii=False)[:_TRACE_MAX])
+        login = route in _LOGIN_ROUTES
+        if not login:
+            self.record_request(route, payload["data"])
+        if login:
+            log.info("[game->] %s request body suppressed (login)", route)
+        else:
+            log.info("[game->] %s %s", route, format_payload(payload))
         try:
             resp = self._client.request("PUT", config.GAME_ROUTER, content=body)
         except (httpx.ProxyError, httpx.ConnectError) as e:
@@ -140,7 +221,6 @@ class GameClient:
             self._proxy = ""
             self._client = self._build_client("")
             resp = self._client.request("PUT", config.GAME_ROUTER, content=body)
-        resp.raise_for_status()
         raw = resp.content
         if raw[:2] == b"\x1f\x8b":
             raw = gzip.decompress(raw)
@@ -153,11 +233,16 @@ class GameClient:
             half = len(msg) // 2
             if len(msg) % 2 == 1 and msg[:half] == msg[half + 1:] and msg[half] == "_":
                 msg = msg[:half]
-            if trace:
-                log.info("[game←] %s 明文消息: %s", route, msg)
+            if login:
+                log.info("[game<-] %s HTTP %s response body suppressed (login)",
+                         route, resp.status_code)
+            else:
+                log.info("[game<-] %s HTTP %s %s", route, resp.status_code,
+                         format_payload(msg))
+            resp.raise_for_status()
             raise GameMessage(msg)
-        if trace:
-            log.info("[game←] %s %s", route, _distill(body))
+        _log_game_response(route, resp.status_code, body, login=login)
+        resp.raise_for_status()
         # 增量维护本地货币/背包：几乎每个操作响应的 Drop.Items[] 和 CostItems[] 都带
         # NowItem（该物品操作后的绝对新余额）。把它写回缓存 ItemContainer，状态栏就能
         # 零额外请求地反映工具自己领取/购买/花费的结果（游戏没有单独查背包的接口）。
@@ -261,20 +346,34 @@ class GameClient:
     # ---- 登录握手 ----
     def bootstrap(self) -> dict:
         """完整登录握手 -> 拿到 AID + SessionID + 账号状态。返回账号状态。"""
-        common = {"Token": self.game_token, **config.LOGIN_COMMON}
+        self._sync_login_auth(False)
+        common = {"Token": self.game_token, **self._login_common}
+        uid_res = {}
 
         # 1. 公告/服务器配置(可选，确认连通)
         self.call("GameServerDBSettingHandler.QueryBulletinInfoResult", {})
 
-        # 2. 换取游戏内 LoginID
-        uid_res = self.call("ErolabsHandler.QueryUserID", dict(common))
-        self.login_id = uid_res.get("LoginID")
+        # V2 门户已经返回 userId，可直接作为 LoginID；旧 WebGL jwt 才需要 QueryUserID。
+        if self._fixed_login_id:
+            self.login_id = self._fixed_login_id
+        else:
+            uid_res = self.call("ErolabsHandler.QueryUserID", dict(common))
+            self.login_id = uid_res.get("LoginID")
         if not self.login_id:
             raise GameError(f"QueryUserID 未返回 LoginID: {uid_res}")
 
         # 3. 正式登录 -> 完整账号状态 + SessionID
         login_data = {**common, "LoginID": self.login_id}
-        state = self.call("AccountHandler.Login", login_data)
+        try:
+            state = self.call("AccountHandler.Login", login_data)
+        except GameMessage as error:
+            if not self._auth_refresher or not self._looks_like_auth_failure(error):
+                raise
+            # Token 可能被门户提前撤销，即使 JWT exp 尚未到期也强制续期并只重试一次。
+            self._sync_login_auth(True)
+            self.login_id = self._fixed_login_id
+            common = {"Token": self.game_token, **self._login_common}
+            state = self.call("AccountHandler.Login", {**common, "LoginID": self.login_id})
         self.session_id = state.get("SessionID")
         self.aid = state.get("Info", {}).get("_id", {}).get("$oid")
         if not self.session_id or not self.aid:

@@ -18,7 +18,7 @@ import kotlin.concurrent.thread
  */
 object AppBootstrap {
 
-    const val PORT = 8000
+    const val PORT = 27843
 
     private val started = AtomicBoolean(false)
 

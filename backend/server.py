@@ -18,6 +18,7 @@ from urllib.parse import unquote, urlparse, parse_qs
 
 from . import appcore
 from . import config
+from .updater import UpdateError, service as update_service
 from .appcore import ApiError
 from .logutil import setup as _setup_log
 
@@ -32,26 +33,43 @@ _STATIC_MOUNTS = {
     "/assets/": appcore.ASSETS_DIR,
 }
 
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 27843
+
 
 def _route_api(method: str, path: str, body: dict, query: dict) -> dict:
     """把 (method, path, body, query) 分派到 appcore，返回结果 dict。
     多账号：account 参数 POST 从 body 取、GET 从 query 取。"""
+    update_routes = {
+        "/api/update/status", "/api/update/check", "/api/update/ignore", "/api/update/install",
+        "/api/logs", "/api/logs/auto", "/api/config",
+    }
+    if update_service.is_installing() and path not in update_routes:
+        raise ApiError(409, "正在准备软件更新，请等待当前操作完成")
     if method == "POST":
         if path == "/api/login":
-            return appcore.login(body["account"], body["password"], body.get("savePwd", False))
-        if path == "/api/login/direct":
-            return appcore.login_direct(body["account"], body["password"],
-                                        body.get("turnstileToken"), body.get("savePwd", False))
-        if path == "/api/login/token":
-            return appcore.login_token(body["gameToken"], body.get("account"))
+            return appcore.login(body["account"], body["password"])
+        if path == "/api/login/saved":
+            return appcore.login_saved(body["account"])
         if path == "/api/tasks/auto":
             return appcore.run_auto(body.get("account"), body.get("taskIds", []), body.get("params", {}))
         if path == "/api/tasks/run":
             return appcore.run(body.get("account"), body.get("taskIds", []), body.get("params", {}))
         if path == "/api/shop/reset":
-            return appcore.shop_reset_ep(body.get("account"), body.get("useGold", True), body.get("autoBuy", []))
+            return appcore.shop_reset_ep(
+                body.get("account"), body.get("useGold", True), body.get("autoBuy", []),
+                body.get("equipmentScheme"),
+            )
         if path == "/api/shop/buy":
             return appcore.shop_buy_ep(body.get("account"), body["index"])
+        if path == "/api/star-source/query":
+            return appcore.star_source_query_ep(body.get("account"))
+        if path == "/api/star-source/refresh":
+            return appcore.star_source_refresh_ep(body.get("account"), body.get("scheme"))
+        if path == "/api/star-source/buy":
+            return appcore.star_source_buy_ep(body.get("account"), body.get("index"))
+        if path == "/api/customized-equip/action":
+            return appcore.customized_equip_ep(body.get("account"), body.get("action"), body)
         if path == "/api/store/buy":
             return appcore.store_buy_ep(body.get("account"), body.get("picks", []))
         if path == "/api/sweep/run":
@@ -75,11 +93,27 @@ def _route_api(method: str, path: str, body: dict, query: dict) -> dict:
             return appcore.logout(body["account"])
         if path == "/api/accounts/delete":
             return appcore.delete_account(body["account"])
+        if path == "/api/accounts/restore":
+            return appcore.restore_account(body["account"])
         if path == "/api/config":
             return appcore.set_config(body.get("proxy"), body.get("proxyMode"))
+        if path == "/api/update/check":
+            return update_service.request_check()
+        if path == "/api/update/ignore":
+            try:
+                return update_service.ignore(str(body.get("version") or ""))
+            except UpdateError as exc:
+                raise ApiError(400, str(exc)) from exc
+        if path == "/api/update/install":
+            try:
+                return update_service.install()
+            except UpdateError as exc:
+                raise ApiError(400, str(exc)) from exc
         if path == "/api/dev/unlock":
             # 设置页那个无提示输入框：只问口令对不对，不暴露口令本身。
             return appcore.dev_unlock(body.get("pass"))
+        if path == "/api/dev/history":
+            return appcore.dev_request_history(body.get("account"), body.get("pass"))
         if path == "/api/dev/call":
             # 开发者模式原始协议控制台。门禁在 appcore.dev_call 里验口令
             # （前端隐藏入口不算限制，见 config.DEV_PASSPHRASE 的注释）。
@@ -107,6 +141,8 @@ def _route_api(method: str, path: str, body: dict, query: dict) -> dict:
             return appcore.arena_options(query.get("account"))
         if path == "/api/config":
             return appcore.get_config()
+        if path == "/api/update/status":
+            return update_service.status()
         if path == "/api/logs":
             return appcore.get_logs()
     raise ApiError(404, f"未知接口 {method} {path}")
@@ -185,7 +221,10 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 result = _route_api(method, path, body, query)
                 self._send_json(result)
-                log.info("%s %s -> 200", method, path)
+                # 日志增量接口由每个在线页面持续轮询；正常响应没有诊断价值，
+                # 记录它只会刷屏并挤掉真正有用的开发者日志。异常仍走下方分支记录。
+                if path not in {"/api/logs/auto", "/api/dev/history", "/api/update/status"}:
+                    log.info("%s %s -> 200", method, path)
             except ApiError as e:
                 self._send_json({"detail": e.message}, e.status)
                 log.warning("%s %s -> %d %s", method, path, e.status, e.message)
@@ -210,15 +249,16 @@ class Handler(BaseHTTPRequestHandler):
         self._dispatch("POST")
 
 
-def make_server(port: int = 8000, host: str = "127.0.0.1") -> ThreadingHTTPServer:
+def make_server(port: int = DEFAULT_PORT, host: str = DEFAULT_HOST) -> ThreadingHTTPServer:
+    update_service.start()
     return ThreadingHTTPServer((host, port), Handler)
 
 
-def serve(port: int = 8000, host: str = "127.0.0.1"):
+def serve(port: int = DEFAULT_PORT, host: str = DEFAULT_HOST):
     srv = make_server(port, host)
     srv.serve_forever()
 
 
 if __name__ == "__main__":
-    print("LucimaTools server on http://127.0.0.1:8000")
+    print(f"LucimaTools server on http://{DEFAULT_HOST}:{DEFAULT_PORT}")
     serve()

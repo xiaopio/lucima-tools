@@ -10,8 +10,10 @@
 """
 from __future__ import annotations
 
+import random
 import threading
 import time
+from datetime import datetime, time as datetime_time, timedelta, timezone
 from typing import Any, Callable
 
 from . import config
@@ -27,16 +29,30 @@ from .tasks import (
 # （reactor=上次领+12h / 生产中心三项=NextCanReceive*Time / dispatch=FinishTime /
 #  shop_free=LastResetTime+1h / 竞技场=各 NPC 的 nextMs|retryMs），
 # 所以调度线程改成"睡到最早那个到点时刻"，并在用户改开关/改勾选时**立刻唤醒**。
-# 只有 abyss_sweep / free_summon 拿不到下次时刻（它们等的是服务器每日重置，时区未确认），
-# 那两个本来就是靠 STATE_REFRESH_GAP 每小时重登刷快照来兜——按那个节奏排期即可。
+# 只有 abyss_sweep / free_summon 拿不到服务器下发的下次时刻。它们依赖每日重置后的
+# 登录快照，因此在东八区每天 08:10~08:30 为每个账号随机安排一次重登。
 SCAN_MIN_GAP = 60               # 秒：两轮之间的下限（防止到点判定抖动导致空转刷屏）
 # 上限=兜底复查。纯保险：档期算漏了/用户在游戏客户端里自己操作导致时刻变了，也不会
-# 永远睡下去。复查本身零成本（任务内部自带到点判断，未到点不发请求），所以取和
-# STATE_REFRESH_GAP 同量级即可；12 小时的动力转换会被复查约 13 次，无所谓。
+# 永远睡下去。复查本身零成本（任务内部自带到点判断，未到点不发请求）。
 SCAN_MAX_GAP = 55 * 60
 SHOP_FREE_MIN_GAP = 55 * 60     # 秒：shop_free 最小间隔（约每小时一次）
-STATE_REFRESH_GAP = 55 * 60     # 秒：账号快照重新拉取间隔（约每小时一次）
 LOG_BUFFER_MAX = 400            # 每账号自动任务日志环形缓冲上限
+GAME_TIMEZONE = timezone(timedelta(hours=8))
+STATE_REFRESH_BOUNDARY = datetime_time(8, 0)
+STATE_REFRESH_WINDOW_START = datetime_time(8, 10)
+STATE_REFRESH_WINDOW_SECONDS = 20 * 60
+
+
+def _next_daily_state_refresh(now: datetime | None = None) -> float:
+    """返回下一次每日快照重登时间戳，固定使用游戏所在的东八区。"""
+    current = (now or datetime.now(GAME_TIMEZONE)).astimezone(GAME_TIMEZONE)
+    target_date = current.date()
+    reset_boundary = datetime.combine(target_date, STATE_REFRESH_BOUNDARY, GAME_TIMEZONE)
+    # 08:00 后建立的会话已经拿到当日重置数据，不再在当天重复登录。
+    if current >= reset_boundary:
+        target_date += timedelta(days=1)
+    window_start = datetime.combine(target_date, STATE_REFRESH_WINDOW_START, GAME_TIMEZONE)
+    return (window_start + timedelta(seconds=random.randint(0, STATE_REFRESH_WINDOW_SECONDS))).timestamp()
 
 
 class Account:
@@ -68,7 +84,7 @@ class Account:
 
         # 调度线程
         self._shop_free_last = 0.0
-        self._state_refresh_last = time.time()   # 刚 bootstrap 过，快照是新的
+        self._state_refresh_at = _next_daily_state_refresh()
         self._stop = threading.Event()
         # 配置变更（开关/勾选）时置位，让调度线程立刻醒来重算档期并跑一轮，
         # 用户不用等到下一个到点时刻。见 notify_config_changed()。
@@ -140,22 +156,27 @@ class Account:
         return ids
 
     def _refresh_state_if_needed(self, ids: list[str]):
-        """跑"判定依赖每日重置字段"的任务前，按小时重新拉一次账号快照。
+        """跑"判定依赖每日重置字段"的任务前，每天重新拉一次账号快照。
 
         必要性：`account_state` 只在 bootstrap（登录）时产生，后台巡检一直复用同一份。
         虚拟幻境的意识同步器补充、免费招募的 FreeBuyCount 归零都是**服务器在每日重置
         后于登录时懒更新**的，不重登就永远读到昨天的值——工具挂机过夜后第二天不会
-        再执行这两项。这里不去猜"每日重置是几点"（时区未确认，猜错要么空转要么漏跑），
-        改成按小时重登刷新，让服务器自己告诉我们最新计数。
+        再执行这两项。游戏在 08:00 前完成重置，因此每个账号在东八区 08:10~08:30
+        随机重登一次，既取得当日数据，也避免多账号集中请求。
         重登失败不影响本轮任务：沿用旧快照，各任务内部的严格判定仍然成立（宁可漏跑）。
         """
         if not needs_fresh_state(ids):
             return
-        if (time.time() - self._state_refresh_last) < STATE_REFRESH_GAP:
-            return
-        self._state_refresh_last = time.time()
         try:
             with self.lock:
+                # 手动刷新可能刚在等待锁期间完成；拿到锁后必须重新检查计划。
+                now = time.time()
+                if now < self._state_refresh_at:
+                    return
+                # 无论本次成功与否都安排到次日，保证后台每天最多自动重登一次。
+                self._state_refresh_at = _next_daily_state_refresh(
+                    datetime.fromtimestamp(now, GAME_TIMEZONE)
+                )
                 self.client.bootstrap()
         except Exception as e:
             _log.warning("账号 %s 刷新快照失败（沿用旧快照）: %s", self.email, e)
@@ -165,16 +186,24 @@ class Account:
         前台手动开关时设 False，由前端直接展示结果、避免与轮询重复。"""
         if not ids:
             return []
+        # 更新安装开始后不再启动新的游戏请求；已经持锁的任务会自然跑完，更新器等待
+        # 所有账号锁释放后才退出/覆盖程序。
+        from .updater import service as update_service
+        if update_service.is_installing():
+            return []
         if "shop_free" in ids:
             self._shop_free_last = time.time()
         self._refresh_state_if_needed(ids)
+        # 分步任务每完成一步就写入缓冲，前端不必等整批请求结束才看到日志。
+        on_partial = lambda result: self.push_log(result, prefix)
         with self.lock:
-            results = run_toggle_tasks(self.client, ids, self.params, self.task_runtime)
+            results = run_toggle_tasks(
+                self.client, ids, self.params, self.task_runtime, on_partial=on_partial)
         if log_to_buffer:
             for r in results:
                 # 只记"确实向服务器发了请求"的结果：到点未满/未到时间而跳过(skipped)的
                 # 不产生请求，不入日志，避免巡检刷屏。
-                if r.get("skipped"):
+                if r.get("skipped") or r.get("liveLogged"):
                     continue
                 self.push_log(r, prefix)
         return results
@@ -189,6 +218,11 @@ class Account:
         用户拨开竞技场开关后再勾 NPC，勾选本身不触发执行；没有这个唤醒，就要等
         下一轮巡检才动，看起来像"隔了几分钟才有日志"。
         """
+        self._wake.set()
+
+    def note_state_refreshed(self):
+        """手动重登成功后重排每日任务，避免当天再次自动重登。"""
+        self._state_refresh_at = _next_daily_state_refresh()
         self._wake.set()
 
     def _next_wake_delay(self) -> float:
@@ -212,8 +246,8 @@ class Account:
                 cands.append(self._arena_due_delay(now_ms))
                 continue
             if TASKS.get(tid, {}).get("needsFreshState"):
-                # 判定依赖每日重置字段，拿不到下次时刻 → 跟着每小时重登的节奏
-                cands.append(max(0.0, self._state_refresh_last + STATE_REFRESH_GAP - now))
+                # 判定依赖每日重置字段，统一排到当天随机生成的快照刷新时刻。
+                cands.append(max(0.0, self._state_refresh_at - now))
                 continue
             if tid == "shop_free":
                 nxt = secret_shop_next_free(self.client.account_state or {})

@@ -12,6 +12,7 @@ import os
 import re
 import uuid
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from typing import Callable
 
 from .game_client import GameClient, GameError, GameMessage
@@ -31,11 +32,35 @@ class UnknownEquipmentError(Exception):
 # 表示"已经做过/无需再做"的明文消息(视为成功)
 _DONE_HINTS = ("Finish", "Already", "Received", "Repeat", "Done", "已", "重复")
 
-# 物品/装备 StaticID -> 官方中文名。
-# 数据源：游戏内官方本地化表，发布数据位于 backend/item_names.json
-# （1668 条，覆盖货币/道具/箱子/芯片/神器/全部装备名）。未知的回退为"道具#ID"。
-# ⚠️ 名称一律以官方 loc 为准（含 91=经验值 而非旧记的金币、3=能源、26=荣誉勋章 等修正）。
+# 运行资源内的官方中文本地化表。完整表由 tools/sync_assets.py 从 assets_full 同步，
+# 旧的精简映射文件仍作为离线/旧安装包的兜底。
+_LOCALIZATION = None
 _ITEM_NAMES = None
+
+
+def _localization() -> dict:
+    """懒加载官方 loc_CHS_FINAL，资源不存在或损坏时返回空映射。"""
+    global _LOCALIZATION
+    if _LOCALIZATION is None:
+        root = Path(os.environ.get("ARK_ASSET_ROOT") or Path(__file__).resolve().parent.parent)
+        path = root / "assets" / "localization" / "loc_CHS_FINAL.json"
+        try:
+            with path.open(encoding="utf-8") as stream:
+                payload = json.load(stream)
+            _LOCALIZATION = payload if isinstance(payload, dict) else {}
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            _LOCALIZATION = {}
+    return _LOCALIZATION
+
+
+def _localized_text(key: str) -> str | None:
+    value = _localization().get(key)
+    if not isinstance(value, str):
+        return None
+    # 本地化表中少数名称带富文本标签；下拉框和日志只需要纯文本。
+    value = re.sub(r"<[^>]*>", "", value)
+    value = re.sub(r"\s+", " ", value).strip()
+    return value or None
 
 
 def _item_names() -> dict:
@@ -47,6 +72,14 @@ def _item_names() -> dict:
                 _ITEM_NAMES = json.load(f)
         except Exception:
             _ITEM_NAMES = {}
+        # loc_CHS_FINAL 会随游戏版本更新，优先覆盖发布时的旧精简表。
+        prefix = "T_Item_Name_"
+        for key, value in _localization().items():
+            if key.startswith(prefix) and isinstance(value, str):
+                sid = key[len(prefix):]
+                text = _localized_text(key)
+                if sid and text:
+                    _ITEM_NAMES[sid] = text
     return _ITEM_NAMES
 
 
@@ -519,6 +552,30 @@ def task_dispatch(c: GameClient) -> dict:
 
 # ============ 秘密商店 ============
 SECRET_STORE_ID = "SecretShop"
+STAR_SOURCE_COMMODITY_ID = "RainbowStarSourceBox10"
+STAR_SOURCE_STORE_ID = "RainbowStarSource"
+CUSTOMIZED_EQUIP_PART_TO_SLOT = {
+    "Weapon": "weapon", "Helmet": "helmet", "Armor": "armor",
+    "Necklace": "necklace", "Ring": "ring", "Shoes": "boots",
+}
+CUSTOMIZED_EQUIP_SLOT_TO_PART = {slot: part for part, slot in CUSTOMIZED_EQUIP_PART_TO_SLOT.items()}
+CUSTOMIZED_EQUIP_MAIN_STATS = {
+    "weapon": {"AttackValue"},
+    "helmet": {"HPValue"},
+    "armor": {"DefenceValue"},
+    "necklace": {
+        "AttackValue", "AttackRate", "DefenceValue", "DefenceRate",
+        "HPValue", "HPRate", "CriticalRate", "CriticalDamageRate",
+    },
+    "ring": {
+        "AttackValue", "AttackRate", "DefenceValue", "DefenceRate",
+        "HPValue", "HPRate", "EffectHitRate", "ResistanceRate",
+    },
+    "boots": {
+        "AttackValue", "AttackRate", "DefenceValue", "DefenceRate",
+        "HPValue", "HPRate", "SpeedValue",
+    },
+}
 # 可自动购买的目标 —— **唯一真源**，前端 /api/tasks 取此表渲染勾选框。
 # ⚠️ 别在前端再写一份：曾经前后端各存一份默认值（前端缺省全选、后端缺省只有 5/6），
 # 结果界面显示"强化芯片"打勾、后端却从不买芯片，用户报"免费刷商店漏买芯片"。
@@ -560,6 +617,29 @@ SET_ICON = {
     "Pinch": "Pinch", "Rage": "Rage", "Torrent": "Riptide",
 }
 
+# 定制装备在活动数据缺少 StaticID 图鉴映射时的图片兜底。
+# 每个晶石系列的六个基础部位资源顺序固定：武器、头盔、铠甲、项链、戒指、鞋子。
+CUSTOMIZED_EQUIP_CRYSTAL_IMAGES = {
+    "fire": {"weapon": "E0061", "helmet": "E0062", "armor": "E0063", "necklace": "E0064", "ring": "E0065", "boots": "E0066"},
+    "nature": {"weapon": "E0121", "helmet": "E0122", "armor": "E0123", "necklace": "E0124", "ring": "E0125", "boots": "E0126"},
+    "ice": {"weapon": "E0181", "helmet": "E0182", "armor": "E0183", "necklace": "E0184", "ring": "E0185", "boots": "E0186"},
+    "dark": {"weapon": "E0241", "helmet": "E0242", "armor": "E0243", "necklace": "E0244", "ring": "E0245", "boots": "E0246"},
+    "brilliant": {"weapon": "E0301", "helmet": "E0302", "armor": "E0303", "necklace": "E0304", "ring": "E0305", "boots": "E0306"},
+}
+CUSTOMIZED_EQUIP_SET_CRYSTAL = {
+    "Critical": "fire", "Hit": "fire", "Speed": "fire",
+    "Attack": "nature", "Health": "nature", "Defense": "nature",
+    "Resist": "ice", "Destruction": "ice", "Lifesteal": "ice", "Counter": "ice",
+    "Pinch": "dark", "Immunity": "dark", "Rage": "dark",
+    "Revenge": "brilliant", "Injury": "brilliant", "Penetration": "brilliant", "Torrent": "brilliant",
+}
+
+
+def _customized_equip_image(set_id: str, slot: str) -> str | None:
+    crystal = CUSTOMIZED_EQUIP_SET_CRYSTAL.get(set_id)
+    image_id = CUSTOMIZED_EQUIP_CRYSTAL_IMAGES.get(crystal, {}).get(slot)
+    return f"/assets/equip/{image_id}.png" if image_id else None
+
 # 属性类型 -> (中文, 是否百分比)。百分比类别展示时加 "%"（攻击力% 等）。
 PROP_CN = {
     "AttackValue": ("攻击力", False), "AttackRate": ("攻击力", True),
@@ -567,7 +647,7 @@ PROP_CN = {
     "HPValue": ("生命值", False), "HPRate": ("生命值", True),
     "CriticalRate": ("暴击率", True), "CriticalDamageRate": ("暴击伤害", True),
     "SpeedValue": ("速度", False), "EffectHitRate": ("效果命中", True),
-    "ResistanceRate": ("效果抵抗", True), "PenetrationRate": ("贯穿", True),
+    "ResistanceRate": ("效果抵抗", True),
 }
 
 # 副属性分数换算系数（参考 wiki Equipment_Stats/Auxiliary Score）。
@@ -654,6 +734,13 @@ def _prop_text(prop: dict) -> dict:
 def parse_equipment(equip: dict) -> dict:
     """把货架里的 Equipment 对象解析成卡片用数据（用已知字段，缺失项留空待图鉴）。"""
     cl = equip.get("ClassLV")
+    enhance = equip.get("Enhance")
+    if enhance is None:
+        enhance = equip.get("EnhanceLevel", 0)
+    try:
+        enhance = max(0, int(round(float(enhance))))
+    except (TypeError, ValueError):
+        enhance = 0
     main = _prop_text(equip.get("MainProp", {}) or {})
     raw_subs = (equip.get("SubProps", {}) or {}).get("SourceValues", [])
     subs = [_prop_text(s) for s in raw_subs]
@@ -671,6 +758,7 @@ def parse_equipment(equip: dict) -> dict:
         "slotCN": SLOT_CN.get(slot, slot),
         "img": f"/assets/equip/{os.path.basename(ref['img'])}" if ref.get("img") else None,
         "classLV": cl,
+        "enhance": enhance,
         "tierName": CLASSLV_TIER.get(cl, f"品阶{cl}"),
         "isLegendary": cl == LEGENDARY_CLASSLV,
         # 掉落展示用：图鉴查不到时不判定(None)，不阻断展示。
@@ -683,6 +771,105 @@ def parse_equipment(equip: dict) -> dict:
         "subProps": subs,
         "auxScore": _aux_score(raw_subs),       # 副属性分数（wiki 换算规则）
     }
+
+
+def _filter_prop_value(prop: dict) -> float | None:
+    """把游戏属性值转成过滤器使用的单位：Rate 小数转为整数百分点。"""
+    try:
+        value = float(prop.get("Value"))
+    except (TypeError, ValueError):
+        return None
+    if str(prop.get("PropertyType") or "").endswith("Rate"):
+        value *= 100
+    return value
+
+
+def _equipment_matches_rule(equip: dict, rule: dict) -> bool:
+    """判断一件装备是否命中一条细则。空主属性表示不限制主属性。"""
+    if not isinstance(rule, dict):
+        return False
+    allowed_sets = rule.get("sets")
+    if not isinstance(allowed_sets, list) or not allowed_sets or equip.get("Set") not in allowed_sets:
+        return False
+
+    raw_subs = (equip.get("SubProps") or {}).get("SourceValues") or []
+    actual_score = _aux_score(raw_subs)
+    if rule.get("forceScoreEnabled"):
+        try:
+            force_score = int(rule.get("forceScore") or 0)
+        except (TypeError, ValueError):
+            return False
+        # 强制命中仍受当前部位和“应用于”套装约束，但跳过主/副属性组合。
+        if actual_score > force_score:
+            return True
+
+    expected_main = str(rule.get("main") or "")
+    actual_main = str((equip.get("MainProp") or {}).get("PropertyType") or "")
+    if expected_main and actual_main != expected_main:
+        return False
+
+    actual_subs = {
+        str(prop.get("PropertyType") or ""): _filter_prop_value(prop)
+        for prop in raw_subs if isinstance(prop, dict) and prop.get("PropertyType")
+    }
+    fixed = []
+    mixed = []
+    for condition in rule.get("subs") or []:
+        if not isinstance(condition, dict):
+            continue
+        stat = str(condition.get("stat") or "")
+        if not stat:
+            continue
+        try:
+            threshold = float(condition.get("value"))
+        except (TypeError, ValueError):
+            return False
+        target = mixed if condition.get("mode") == "mixed" else fixed
+        target.append((stat, threshold))
+
+    def condition_hit(condition: tuple[str, float]) -> bool:
+        stat, threshold = condition
+        actual = actual_subs.get(stat)
+        return actual is not None and actual + 1e-9 >= threshold
+
+    if not all(condition_hit(condition) for condition in fixed):
+        return False
+
+    remaining_slots = max(0, 4 - len(fixed))
+    if len(mixed) == 1:
+        mixed_required = 1 if remaining_slots else 0
+    elif len(mixed) >= 2:
+        max_required = max(0, min(len(mixed) - 1, remaining_slots))
+        try:
+            requested = int(rule.get("mixRequired") or 0)
+        except (TypeError, ValueError):
+            requested = 0
+        mixed_required = requested if 1 <= requested <= max_required else max_required
+    else:
+        mixed_required = 0
+    if sum(1 for condition in mixed if condition_hit(condition)) < mixed_required:
+        return False
+
+    if rule.get("scoreEnabled"):
+        try:
+            min_score = int(rule.get("minScore") or 0)
+        except (TypeError, ValueError):
+            return False
+        if actual_score < min_score:
+            return False
+    return True
+
+
+def equipment_matches_filter_scheme(equip: dict, scheme: dict) -> bool:
+    """任一当前部位细则命中即视为方案命中；未配置该部位时不命中。"""
+    if not isinstance(scheme, dict):
+        return False
+    if not _is_level_85_legendary(equip):
+        return False
+    sid = str(equip.get("StaticID") or "")
+    slot = (_equip_ref().get(sid) or {}).get("slot")
+    rules = ((scheme.get("slots") or {}).get(slot) or []) if slot else []
+    return any(_equipment_matches_rule(equip, rule) for rule in rules)
 
 
 def _to_send_format(obj):
@@ -802,11 +989,12 @@ def _buy_from_shelf(c: GameClient, records: list, wanted: list, counter: dict) -
 
 
 # ---- 钻石刷商店：原子接口（前端编排循环，严格保证"上一次买完再刷下一次") ----
-def shop_reset(c: GameClient, use_gold: bool, auto_buy_sids: list) -> dict:
+def shop_reset(c: GameClient, use_gold: bool, auto_buy_sids: list,
+               equipment_scheme: dict | None = None) -> dict:
     """刷新一次秘密商店：
     1) ResetRandomStore（use_gold 决定花钻/免费）
     2) 服务器端立即买掉普通档里 StaticID∈auto_buy_sids 的
-    3) 收集 85 级传说 的装备档（严格判定，带 index，供前端逐张按 index 购买）
+    3) 收集 85 级传说装备；提供筛选方案时，命中方案的装备立即购买
     返回本次结果 + 缓存本次货架 records（供 shop_buy_index 用）。
     """
     wanted = [str(x) for x in (auto_buy_sids or [])]
@@ -819,6 +1007,8 @@ def shop_reset(c: GameClient, use_gold: bool, auto_buy_sids: list) -> dict:
     records = [r for r in res.get("Records", []) if r.get("Store") == SECRET_STORE_ID]
     counter: dict = {}
     legendaries = []
+    legendary_matches = []
+    legendary_lines = []
     buy_errors = []  # 目标道具购买失败(缺钱等)：不吞掉，暴露给前端而不是悄悄漏买
     for idx, rec in enumerate(records):
         if rec.get("BuyCount"):
@@ -841,6 +1031,22 @@ def shop_reset(c: GameClient, use_gold: bool, auto_buy_sids: list) -> dict:
                 card = parse_equipment(equip)
                 card["index"] = idx
                 legendaries.append(card)
+                if isinstance(equipment_scheme, dict) and equipment_matches_filter_scheme(equip, equipment_scheme):
+                    matched = {**card, "purchased": False}
+                    payload = c._auth_data({
+                        "Record": _to_send_format(rec), "Count": 1, "ItemIndex": -1,
+                        "Platform": "WebGLPlayer", "LoginType": "Erolabs",
+                        "NewErolabs": 0, "SelectRoleID": "",
+                    })
+                    label = f"{card['level']}级{card['tierName']}·{card['setCN']}套装·{card['slotCN']}"
+                    try:
+                        c.call("StoreHandler.BuyCommodity", payload)
+                        matched["purchased"] = True
+                        legendary_lines.append(f"购买 {label}")
+                    except GameMessage as message:
+                        matched["purchaseError"] = message.msg
+                        buy_errors.append(f"第 {idx + 1} 档({label})购买失败：{message.msg}")
+                    legendary_matches.append(matched)
             continue
         sid = _record_goods_sid(rec)
         if sid is not None and str(sid) in wanted:
@@ -860,7 +1066,8 @@ def shop_reset(c: GameClient, use_gold: bool, auto_buy_sids: list) -> dict:
     lines = [f"购买 {_fmt_items(counter)}"] if counter else []
     return {
         "ok": True, "records": records, "bought": counter,
-        "boughtLines": lines, "buyErrors": buy_errors, "legendaries": legendaries,
+        "boughtLines": [*lines, *legendary_lines], "buyErrors": buy_errors,
+        "legendaries": legendaries, "legendaryMatches": legendary_matches,
     }
 
 
@@ -890,13 +1097,257 @@ def shop_buy_index(c: GameClient, records: list, index: int) -> dict:
     return {"ok": True, "detail": f"购买了 {name}", "name": name}
 
 
+def _star_source_refresh_result(res: dict, scheme: dict) -> dict:
+    """解析星源商店刷新响应，并按装备过滤方案检查本轮新装备。"""
+    data = res.get("Data") if isinstance(res.get("Data"), dict) else res
+    drops = data.get("CustomEquipDropList") or []
+    cards = []
+    matches = []
+    for shop_index, drop in enumerate(drops):
+        equip = (drop or {}).get("Equipment") if isinstance(drop, dict) else None
+        if not isinstance(equip, dict):
+            continue
+        card = parse_equipment(equip)
+        # DropIndex is always 0 in the real response. StoreHandler.BuyCommodity
+        # instead expects the equipment's position in CustomEquipDropList.
+        card["shopIndex"] = shop_index
+        cards.append(card)
+        if equipment_matches_filter_scheme(equip, scheme):
+            matches.append(card)
+    return {
+        "ok": True,
+        "cards": cards,
+        "matches": matches,
+        "refreshCount": data.get("RefreshCount"),
+        "revertTime": data.get("RevertTime"),
+    }
+
+
+def star_source_query(c: GameClient) -> dict:
+    """进入星源商店以同步跨日次数；Query 返回的历史货架不参与筛选。"""
+    try:
+        res = c.call(
+            "CustomEquipHandler.Query",
+            c._auth_data({"CommodityID": STAR_SOURCE_COMMODITY_ID}),
+        )
+    except GameMessage as m:
+        return {
+            "ok": False, "error": m.msg, "refreshCount": None,
+        }
+    data = res.get("Data") if isinstance(res.get("Data"), dict) else res
+    return {
+        "ok": True,
+        "refreshCount": data.get("RefreshCount"),
+        "revertTime": data.get("RevertTime"),
+    }
+
+
+def star_source_refresh(c: GameClient, scheme: dict) -> dict:
+    """刷新一次星源商店，并按装备过滤方案返回本轮命中的装备。"""
+    try:
+        res = c.call(
+            "CustomEquipHandler.RefreshEquip",
+            c._auth_data({"CommodityID": STAR_SOURCE_COMMODITY_ID}),
+        )
+    except GameMessage as m:
+        return {
+            "ok": False, "error": m.msg, "cards": [], "matches": [],
+            "refreshCount": None,
+        }
+
+    return _star_source_refresh_result(res, scheme)
+
+
+def star_source_buy(c: GameClient, shop_index: int) -> dict:
+    """Buy one item from the current star-source shelf by its zero-based index."""
+    if isinstance(shop_index, bool) or not isinstance(shop_index, int) or not 0 <= shop_index < 3:
+        return {"ok": False, "detail": "购买失败：装备位置无效"}
+
+    state = c.account_state or {}
+    records = (state.get("StoreRecordContainer") or {}).get("Records") or []
+    record = next(
+        (item for item in records if item.get("StaticID") == STAR_SOURCE_COMMODITY_ID),
+        None,
+    )
+    if record is None:
+        # The official client also creates an empty CommodityRecord locally
+        # when this static shelf has never been purchased on the account.
+        record = _synth_record(STAR_SOURCE_COMMODITY_ID, STAR_SOURCE_STORE_ID)
+
+    try:
+        response = c.call(
+            "StoreHandler.BuyCommodity",
+            _buy_payload(c, record, 1, {"ItemIndex": shop_index}),
+        )
+    except GameMessage as message:
+        return {"ok": False, "detail": f"购买失败：{message.msg}"}
+
+    spent: dict = {}
+    _collect_items(response.get("CostItems", []), spent)
+    detail = "购买成功"
+    if spent:
+        detail += f"，花费 {_fmt_items(spent)}"
+    return {"ok": True, "detail": detail, "shopIndex": shop_index}
+
+
+# ============ 装备活动（定制装备） ============
+def _customized_equip_payload(response: dict) -> tuple[dict, dict]:
+    """返回 (响应主体, CustomizedEquipData)，兼容查询与操作接口的两种包裹结构。"""
+    payload = response.get("Data") if isinstance(response.get("Data"), dict) else response
+    customized = payload.get("CustomizedEquipData") if isinstance(payload.get("CustomizedEquipData"), dict) else payload
+    return payload, customized
+
+
+def _customized_equip_state(response: dict, scheme: dict | None = None) -> dict:
+    payload, customized = _customized_equip_payload(response)
+    equip = customized.get("CustomizedEquip") if isinstance(customized.get("CustomizedEquip"), dict) else {}
+    static_id = str(equip.get("StaticID") or "")
+    slot = (_equip_ref().get(static_id) or {}).get("slot") if static_id else None
+    set_id = str(equip.get("Set") or "")
+    main = str(customized.get("MainProp") or "")
+    if not main or main == "None":
+        main = str((equip.get("MainProp") or {}).get("PropertyType") or "")
+        if main == "HP" and not static_id:
+            main = ""
+
+    current_card = None
+    if static_id:
+        current_card = parse_equipment(equip)
+        if not current_card.get("img"):
+            current_card["img"] = _customized_equip_image(set_id, slot)
+        if not (equip.get("MainProp") or {}).get("PropertyType"):
+            current_card["mainProp"] = {"type": "", "label": "尚未选择", "text": "—"}
+
+    copy_props = customized.get("SubPropsCopy")
+    candidate_card = None
+    candidate_equip = None
+    if static_id and isinstance(copy_props, dict) and copy_props.get("SourceValues"):
+        candidate_equip = {**equip, "SubProps": copy_props}
+        candidate_card = parse_equipment(candidate_equip)
+        if not candidate_card.get("img"):
+            candidate_card["img"] = _customized_equip_image(set_id, slot)
+
+    evaluated_equip = candidate_equip
+    # 初次 RefreshSubProp 会直接生成当前副属性，不产生 SubPropsCopy。
+    if evaluated_equip is None and (equip.get("SubProps") or {}).get("SourceValues"):
+        evaluated_equip = equip
+    matches = bool(
+        evaluated_equip is not None
+        and isinstance(scheme, dict)
+        and equipment_matches_filter_scheme(evaluated_equip, scheme)
+    )
+
+    costs = []
+    for entry in payload.get("CostItems") or []:
+        item = entry.get("Item") if isinstance(entry, dict) else None
+        if not isinstance(item, dict):
+            continue
+        costs.append({"staticID": item.get("StaticID"), "count": item.get("Count")})
+
+    return {
+        "ok": True,
+        "stage": str(customized.get("Stage") or ""),
+        "set": set_id,
+        "setCN": SET_CN.get(set_id, set_id),
+        "setIcon": f"/assets/sets/{SET_ICON[set_id]}.png" if set_id in SET_ICON else None,
+        "slot": slot,
+        "part": CUSTOMIZED_EQUIP_SLOT_TO_PART.get(slot, ""),
+        "slotCN": SLOT_CN.get(slot, slot or ""),
+        "main": main,
+        "currentCard": current_card,
+        "candidateCard": candidate_card,
+        "card": candidate_card or current_card,
+        "hasCandidate": candidate_card is not None,
+        "matches": matches,
+        "costs": costs,
+    }
+
+
+def _customized_equip_call(
+    c: GameClient, route: str, data: dict | None = None, scheme: dict | None = None,
+) -> dict:
+    try:
+        response = c.call(route, c._auth_data(data or {}))
+    except GameMessage as message:
+        return {"ok": False, "error": message.msg}
+    return _customized_equip_state(response, scheme)
+
+
+def customized_equip_query(c: GameClient, scheme: dict | None = None) -> dict:
+    return _customized_equip_call(
+        c, "CustomizedEquipHandler.QueryCustomizedEquipData", scheme=scheme,
+    )
+
+
+def customized_equip_choose_set(c: GameClient, set_id: str) -> dict:
+    if set_id not in SET_CN:
+        return {"ok": False, "error": "无效的套装"}
+    return _customized_equip_call(c, "CustomizedEquipHandler.ChooseSet", {
+        "SetString": set_id, "Part": "Weapon", "MainProp": "None", "IsChangeSubProps": 0,
+    })
+
+
+def customized_equip_choose_part(c: GameClient, part: str) -> dict:
+    if part not in CUSTOMIZED_EQUIP_PART_TO_SLOT:
+        return {"ok": False, "error": "无效的装备部位"}
+    return _customized_equip_call(c, "CustomizedEquipHandler.ChoosePart", {
+        "Part": part, "MainProp": "None", "IsChangeSubProps": 0,
+    })
+
+
+def customized_equip_choose_main(c: GameClient, part: str, main_prop: str) -> dict:
+    slot = CUSTOMIZED_EQUIP_PART_TO_SLOT.get(part)
+    if slot is None or main_prop not in CUSTOMIZED_EQUIP_MAIN_STATS.get(slot, set()):
+        return {"ok": False, "error": "当前部位不支持该主属性"}
+    return _customized_equip_call(c, "CustomizedEquipHandler.ChooseProp", {
+        # 抓包中 ChooseProp 的 Part 固定为 Weapon，实际选择由之前的 ChoosePart 状态决定。
+        "Part": "Weapon", "MainProp": main_prop, "IsChangeSubProps": 0,
+    })
+
+
+def customized_equip_reset(c: GameClient, level: str) -> dict:
+    reset_flags = {
+        "set": {"IsResetSet": 1, "IsResetPart": 0, "IsResetMainProp": 0},
+        "part": {"IsResetSet": 0, "IsResetPart": 1, "IsResetMainProp": 0},
+        "main": {"IsResetSet": 0, "IsResetPart": 0, "IsResetMainProp": 1},
+    }
+    if level not in reset_flags:
+        return {"ok": False, "error": "无效的重置层级"}
+    return _customized_equip_call(
+        c, "CustomizedEquipHandler.ResetCustomizedEquipStage", reset_flags[level],
+    )
+
+
+def customized_equip_refresh(c: GameClient, scheme: dict) -> dict:
+    if not isinstance(scheme, dict):
+        return {"ok": False, "error": "筛选方案格式无效"}
+    return _customized_equip_call(c, "CustomizedEquipHandler.RefreshSubProp", scheme=scheme)
+
+
+def customized_equip_choose_sub(c: GameClient, accept: bool) -> dict:
+    return _customized_equip_call(c, "CustomizedEquipHandler.ChooseSubProp", {
+        "Part": "Weapon", "MainProp": "None", "IsChangeSubProps": int(bool(accept)),
+    })
+
+
+def customized_equip_reward(c: GameClient) -> dict:
+    """领取当前定制装备，并由响应中的 Stage=Rewarded 标记为已领取。"""
+    return _customized_equip_call(c, "CustomizedEquipHandler.RewardEquip")
+
+
 def task_shop_free(c: GameClient, params: dict | None = None) -> dict:
-    """刷秘密商店（免费）：用每小时免费额度刷新一次，买货架上的目标道具。
-    无免费额度时回退读当前货架购买（不花钻）。"""
+    """刷秘密商店（免费），并避免刷新前遗漏当前货架上的目标道具。
+
+    每次任务触发时先检查缓存中的当前货架并购买目标道具，再尝试免费刷新；
+    刷新成功后再检查新货架。这样即使服务器判定免费冷却尚未结束，刷新前的
+    目标道具也已经处理，不会因为覆盖货架而丢失。
+    """
     params = params or {}
     wanted = [str(x) for x in (params.get("wanted") or DEFAULT_SHOP_WANTED)]
 
     counter: dict = {}
+    errors = _buy_from_shelf(
+        c, _secret_shop_records(c.account_state or {}), wanted, counter)
     note = ""
     try:
         res = c.call("StoreHandler.ResetRandomStore",
@@ -907,15 +1358,24 @@ def task_shop_free(c: GameClient, params: dict | None = None) -> dict:
     except GameMessage as m:
         # 免费额度未恢复：服务器回明文 `CantReset`（2026-07-30 真机实测，不扣任何货币）。
         # 正常情况下调度已按货架 LastResetTime+1h 闸门过，不该走到这里；真走到了说明
-        # 档期算早了或货架被游戏客户端刷过，直接跳过本轮，**不再拿缓存货架顶替**——
-        # 那份缓存可能已过期（手动钻石刷不写回旧档），拿旧 record 去买只会被服务器拒。
+        # 档期算早了或货架被游戏客户端刷过。当前货架已在刷新请求前检查，
+        # 因此这里只跳过刷新，不再重复使用缓存货架。
         if "cantreset" in m.msg.replace(" ", "").lower():
-            return {"ok": True, "skipped": True,
-                    "detail": "免费刷新冷却中（服务器：CantReset），本轮跳过",
-                    "lines": []}
+            lines = []
+            if counter:
+                lines.append(f"购买 {_fmt_items(counter)}")
+            lines.extend(errors)
+            if counter or errors:
+                lines.append("免费刷新冷却中（服务器：CantReset），本轮跳过")
+            return {
+                "ok": True,
+                "skipped": not bool(counter or errors),
+                "detail": "；".join(lines),
+                "lines": lines,
+            }
         raise
 
-    errors = _buy_from_shelf(c, records, wanted, counter)
+    errors.extend(_buy_from_shelf(c, records, wanted, counter))
 
     lines = []
     if counter:
@@ -1331,15 +1791,44 @@ def task_free_summon(c: GameClient) -> dict:
 
 
 # ============ 讨伐扫荡 ============
-# 候选关卡固定 5 个(各元素 Hunt*_11)。System 字段用于匹配账号 Teams.SystemTeamIDMap /
-# TeamSettingHandler 里观测到的字符串，仅用于展示，不参与请求体。
-HUNT_SWEEP_CANDIDATES = [
-    {"id": "HuntFire_11", "system": "HuntFire", "element": "fire", "name": "火讨伐11"},
-    {"id": "HuntIce_11", "system": "HuntIce", "element": "water", "name": "水讨伐11"},
-    {"id": "HuntEarth_11", "system": "HuntEarth", "element": "wood", "name": "木讨伐11"},
-    {"id": "HuntDark_11", "system": "HuntDark", "element": "dark", "name": "暗讨伐11"},
-    {"id": "HuntLight_11", "system": "HuntLight", "element": "light", "name": "光讨伐11"},
+# 讨伐属性顺序与界面一致。账号快照只会为已解锁关卡生成 Scenes 记录；其中可能包含
+# 尚未通关的下一关，仍允许用户选择并交给服务器正常校验、返回错误。
+HUNT_ELEMENTS = [
+    {"id": "fire", "name": "火", "system": "HuntFire"},
+    {"id": "wood", "name": "木", "system": "HuntEarth"},
+    {"id": "water", "name": "水", "system": "HuntIce"},
+    {"id": "dark", "name": "暗", "system": "HuntDark"},
+    {"id": "light", "name": "光", "system": "HuntLight"},
 ]
+_HUNT_RE = re.compile(r"^(Hunt(?:Fire|Earth|Ice|Dark|Light))_(\d+)$")
+
+
+def hunt_sweep_scenes(state: dict) -> list[dict]:
+    """返回账号已解锁的全部讨伐关卡，属性内按关卡号倒序。"""
+    by_system: dict[str, list[tuple[int, str]]] = {
+        element["system"]: [] for element in HUNT_ELEMENTS
+    }
+    for scene in (state or {}).get("SceneDataContainer", {}).get("Scenes", []):
+        match = _HUNT_RE.match(str(scene.get("StaticID", "")))
+        if not match or match.group(1) not in by_system:
+            continue
+        by_system[match.group(1)].append((int(match.group(2)), match.group(0)))
+
+    result = []
+    for element in HUNT_ELEMENTS:
+        stages = sorted(by_system[element["system"]], reverse=True)
+        result.extend({
+            "id": scene_id,
+            "system": element["system"],
+            "element": element["id"],
+            "floor": floor,
+            "name": f"关卡{floor}",
+        } for floor, scene_id in stages)
+    return result
+
+
+# 保留名称供旧调用方导入；实际选项由 hunt_sweep_scenes 根据账号快照生成。
+HUNT_SWEEP_CANDIDATES: list[dict] = []
 
 # 元素扫荡（游戏内"元素探索"，loc: T_Episode_Name_Elf）。与讨伐同走 SceneHandler.FinishScene，
 # 场景对象结构完全一致，故复用 sweep_once。区别: 元素探索有"难度"维度——每个元素 4 档
@@ -1531,7 +2020,7 @@ _ACTIVITY_NAMES: dict | None = None
 
 
 def _activity_names() -> dict:
-    """读取随应用发布的 BH### -> 章节中文名索引，懒加载。"""
+    """读取官方 loc 的 BH### -> 章节中文名，旧索引作为兜底。"""
     global _ACTIVITY_NAMES
     if _ACTIVITY_NAMES is None:
         p = os.path.join(os.path.dirname(__file__), "activity_names.json")
@@ -1540,6 +2029,13 @@ def _activity_names() -> dict:
                 _ACTIVITY_NAMES = json.load(f)
         except Exception:
             _ACTIVITY_NAMES = {}
+        prefix = "T_Chapter_Name_Branch"
+        for key in _localization():
+            if key.startswith(prefix):
+                family = key[len(prefix):]
+                text = _localized_text(key)
+                if family and text:
+                    _ACTIVITY_NAMES["BH" + family[1:] if family.startswith("H") else family] = text
     return _ACTIVITY_NAMES
 
 
@@ -1581,11 +2077,10 @@ _ACTIVITY_TIERS = {12: "困难", 13: "精英", 14: "地狱"}
 
 
 def activity_scenes(state: dict) -> list[dict]:
-    """从账号快照抽出**当期**可打的活动关卡族(每族取最高关=boss关)。
+    """从账号快照抽出当期活动的全部已解锁关卡，每个活动内按关卡倒序。
 
-    返回 [{id: 最高关StaticID, family: BH###, name: 展示名, hero: 角色名, tier: 难度}]。
-    展示名 = "章节名 · 难度"(章节名查 activity_names, 难度按段号查 _ACTIVITY_TIERS);
-    章节名缺失回退族标识、难度缺失省略(纯展示，不阻断)。角色名仍随条目返回但不进展示名。
+    SceneDataContainer 里存在记录即视为已解锁，不检查 Stars；未通关关卡仍允许选择，
+    执行时交给服务器正常校验。展示名包含活动名与关卡编号，特殊难度槽位追加难度。
 
     ⚠️ 必须按排期过滤: 活动结束后 SceneDataContainer 里的 BH 关卡记录**不会**可靠清理
     (实测 BH187 结束 8 天后仍在，满级号积压 22 个历史族)，全列出来用户会选到已过期的
@@ -1603,22 +2098,31 @@ def activity_scenes(state: dict) -> list[dict]:
     sched = _activity_schedule(state)
     now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
     out = []
-    for fam, stages in fam_stages.items():
+    for fam in sorted(fam_stages):
         # BH188 -> BranchH188。排期表非当期(含查不到)的族直接跳过。
         if not _is_activity_live(sched.get("Branch" + fam[1:]), now_ms):
             continue
-        chapter_no, stage_no, top = max(stages)   # (章,关) 最大 = 最高难度关
         hero = item_name("H" + fam[2:])           # BH188 -> H188 -> 角色名
-        chapter = names.get(fam)
-        tier = _ACTIVITY_TIERS.get(stage_no)
-        # 展示名: 章节名 · 难度(用户定，不带角色名)。章节名查不到回退族标识、
-        # 难度缺失省略——纯展示 fail-soft，不阻断
-        label = chapter or fam
-        if tier:
-            label += f" · {tier}"
-        out.append({"id": top, "family": fam, "name": label,
-                    "hero": hero, "tier": tier})
-    out.sort(key=lambda x: x["family"])
+        activity_name = names.get(fam) or fam
+        for chapter_no, stage_no, scene_id in sorted(fam_stages[fam], reverse=True):
+            tier = _ACTIVITY_TIERS.get(stage_no)
+            scene_key = f"T_Scene_Name_Branch{fam[1:]}"
+            if stage_no != 1:
+                scene_key += f"_{stage_no}"
+            stage_label = _localized_text(scene_key) or f"关卡{stage_no}"
+            if chapter_no != 1:
+                stage_label = f"第{chapter_no}章 · {stage_label}"
+            if tier:
+                stage_label += f"（{tier}）"
+            out.append({
+                "id": scene_id,
+                "family": fam,
+                "name": f"{activity_name} · {stage_label}",
+                "hero": hero,
+                "chapter": chapter_no,
+                "stage": stage_no,
+                "tier": tier,
+            })
     return out
 
 
@@ -1910,7 +2414,7 @@ def arena_sweep_once(c: GameClient, n: int, team_id: str) -> dict:
     items_txt = _fmt_items(counter)
     win = bool(res.get("IsWin"))
     score = res.get("AddScore")
-    bits = [name, "胜" if win else "负"]
+    bits = [name]
     if score:
         bits.append(f"积分+{score}")
     if items_txt:
@@ -1927,7 +2431,8 @@ ARENA_RETRY_GAP_MS = int(1.01 * 3600 * 1000)
 
 
 def task_arena_npc(c: GameClient, params: dict | None = None,
-                   rt: dict | None = None) -> dict:
+                   rt: dict | None = None,
+                   emit: Callable[[dict], None] | None = None) -> dict:
     """竞技场 NPC(地狱级) 自动扫荡。勾选的 NPC 逐个挑战，失败的挂 1.01h 退避。
 
     params: {"picked": [n...], "teamId": "0"}
@@ -1967,7 +2472,7 @@ def task_arena_npc(c: GameClient, params: dict | None = None,
         return {"ok": True, "skipped": True,
                 "detail": f"勾选的 {waiting} 个 NPC 都在冷却中，跳过"}
 
-    lines, ok_count, fail_count = [], 0, 0
+    lines, fail_count = [], 0
     for n in due:
         sid = arena_scene_id(n)
         try:
@@ -1976,7 +2481,6 @@ def task_arena_npc(c: GameClient, params: dict | None = None,
             # 队伍/名字表这类配置问题：整个任务失败，不逐个重试
             return {"ok": False, "detail": str(e)}
         if r.get("ok"):
-            ok_count += 1
             retry_map.pop(sid, None)
             if r.get("nextMs"):
                 next_map[sid] = r["nextMs"]
@@ -1984,13 +2488,15 @@ def task_arena_npc(c: GameClient, params: dict | None = None,
             fail_count += 1
             retry_map[sid] = now_ms + ARENA_RETRY_GAP_MS
         lines.append(r["detail"])
+        if emit is not None:
+            emit({"ok": bool(r.get("ok")), "detail": r["detail"]})
 
-    head = f"挑战 {len(due)} 个：成功 {ok_count}"
-    if fail_count:
-        head += f"、失败 {fail_count}（各等 1.01 小时后重试）"
-    if waiting:
-        head += f"；{waiting} 个仍在冷却"
-    return {"ok": fail_count == 0, "lines": [head] + lines, "detail": head}
+    return {
+        "ok": fail_count == 0,
+        "lines": lines,
+        "detail": lines[-1],
+        "liveLogged": emit is not None,
+    }
 
 
 def task_friend_support(c: GameClient) -> dict:
@@ -2048,7 +2554,7 @@ TASKS: dict[str, dict] = {
         "fn": task_shop_free, "kind": "toggle", "wantsBuyTargets": True,
     },
     # needsFreshState：判定只看账号快照里的"每日重置"字段（同步器补充 / 免费额度），
-    # 而快照只在 bootstrap 时刷新 —— 后台调度据此每小时重登一次，否则挂机过夜后
+    # 而快照只在 bootstrap 时刷新 —— 后台调度据此每天在重置后重登一次，否则挂机过夜后
     # 永远看不到第二天的重置（详见 accounts.Account._refresh_state_if_needed）。
     "abyss_sweep": {
         "name": "虚拟幻境", "desc": f"扫荡已通关最高层（未达 {ABYSS_MIN_FLOOR} 层不扫）",
@@ -2061,8 +2567,9 @@ TASKS: dict[str, dict] = {
     # 唯一"开关 + 展开页"的 toggle 任务(其余带 ui 的都是 manual)：展开页里勾选要打的
     # NPC。wantsRuntime=True 让 run_toggle_tasks 把该账号的退避状态传给 fn 第三参。
     "arena_npc": {
-        "name": "竞技场 NPC", "desc": "自动挑战勾选的地狱级 NPC（每次消耗 1 面旗帜）",
-        "fn": task_arena_npc, "kind": "toggle", "ui": "arena", "wantsRuntime": True,
+        "name": "竞技场NPC", "desc": "自动挑战勾选的地狱级 NPC（每次消耗 1 面旗帜）",
+        "fn": task_arena_npc, "kind": "toggle", "ui": "arena",
+        "wantsRuntime": True, "streamsResults": True,
     },
     "claim_mail": {
         "name": "一键领邮件", "desc": "领取邮箱内所有未领奖励",
@@ -2072,8 +2579,16 @@ TASKS: dict[str, dict] = {
         "name": "秘密商店刷新(钻石)", "desc": "花钻石刷新指定次数，遇目标道具自动购买",
         "kind": "manual", "ui": "shop",  # 前端自定义渲染(选项展开+卡片)，走 /api/shop/* 而非 /api/tasks/run
     },
+    "star_source_shop": {
+        "name": "星源商店刷新", "desc": "按装备筛选方案刷新，命中目标装备后立即停止",
+        "kind": "manual", "ui": "starshop",
+    },
+    "customized_equip": {
+        "name": "装备活动刷新", "desc": "自选套装、部位与主属性，按筛选方案刷新副属性",
+        "kind": "manual", "ui": "customizedequip",
+    },
     "hunt_sweep": {
-        "name": "讨伐扫荡", "desc": "选关卡+队伍，按次数循环扫荡，无掉落自动停止",
+        "name": "讨伐扫荡", "desc": "选择属性、已解锁关卡与队伍，按次数循环扫荡，无掉落自动停止",
         "kind": "manual", "ui": "sweep", "sweepKind": "hunt",  # 前端自定义渲染，走 /api/sweep/* 而非 /api/tasks/run
     },
     "element_sweep": {
@@ -2081,7 +2596,7 @@ TASKS: dict[str, dict] = {
         "kind": "manual", "ui": "sweep", "sweepKind": "elf",
     },
     "activity_scene": {
-        "name": "活动关卡", "desc": "选当期活动关卡+队伍+助战好友，按次数循环扫荡，无掉落自动停止",
+        "name": "活动关卡", "desc": "选择当期已解锁关卡、队伍与助战好友，按次数循环扫荡，无掉落自动停止",
         "kind": "manual", "ui": "activity",  # 前端自定义渲染，走 /api/activity/* 而非 /api/tasks/run
     },
     "store_buy": {
@@ -2092,7 +2607,8 @@ TASKS: dict[str, dict] = {
 
 
 def run_task(client: GameClient, task_id: str, params: dict | None = None,
-             runtime: dict | None = None) -> dict:
+             runtime: dict | None = None,
+             on_partial: Callable[[dict], None] | None = None) -> dict:
     if task_id not in TASKS:
         raise GameError(f"未知任务: {task_id}")
     meta = TASKS[task_id]
@@ -2101,6 +2617,8 @@ def run_task(client: GameClient, task_id: str, params: dict | None = None,
         raise GameError(f"任务 {task_id} 无执行函数（前端自定义 UI 任务，应走专用接口）")
     # wantsRuntime 的任务(竞技场)要第三参：该账号跨轮次保留的退避状态
     if meta.get("wantsRuntime"):
+        if meta.get("streamsResults"):
+            return fn(client, params, runtime if runtime is not None else {}, on_partial)
         return fn(client, params, runtime if runtime is not None else {})
     # 只给接受第二个形参的任务传参（shop 系列）
     if len(inspect.signature(fn).parameters) >= 2:
@@ -2123,7 +2641,8 @@ def run_auto_tasks(client: GameClient) -> list[dict]:
 
 
 def run_toggle_tasks(client: GameClient, task_ids: list[str], params: dict | None = None,
-                     runtime: dict | None = None) -> list[dict]:
+                     runtime: dict | None = None,
+                     on_partial: Callable[[dict], None] | None = None) -> list[dict]:
     """按前端开关执行 toggle 类任务。params 为 {task_id: {...}} 或全局 dict。
 
     runtime: {task_id: {...}} 每任务的跨轮次运行时状态(目前只有竞技场用，存退避)。
@@ -2138,7 +2657,11 @@ def run_toggle_tasks(client: GameClient, task_ids: list[str], params: dict | Non
             continue
         p = params.get(tid, params)  # 支持按任务传参或共享参数
         try:
-            r = run_task(client, tid, p, runtime.setdefault(tid, {}))
+            emit = None
+            if on_partial is not None and t.get("streamsResults"):
+                def emit(partial, task_id=tid, task=t):
+                    on_partial({"id": task_id, "name": task["name"], **partial})
+            r = run_task(client, tid, p, runtime.setdefault(tid, {}), emit)
         except Exception as e:
             r = {"ok": False, "detail": str(e)}
         results.append({"id": tid, "name": t["name"], **r})
